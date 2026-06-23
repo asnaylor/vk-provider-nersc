@@ -10,10 +10,10 @@ helm install vk-nersc ./chart -f chart/values-dev.yaml
 helm install vk-nersc ./chart -f chart/values-production.yaml
 ```
 
-## Create a Workload Token Secret
+## Create a Workload Credential Secret
 ```bash
-kubectl create secret generic sf-api-token \
-  --from-literal=token=<your_superfacility_api_token>
+kubectl create secret generic sfapi-client \
+  --from-file=sf_api.json=./sf_api.json
 ```
 
 ## Enable StatefulSet via Helm Values
@@ -23,8 +23,8 @@ statefulset:
   name: hpc-stateful
   replicas: 3
   account: m1234
-  tokenSecretName: sf-api-token
-  tokenSecretKey: token
+  credentialSecretName: sfapi-client
+  credentialSecretKey: sf_api.json
   inputSource: "globus://endpoint-id/path/to/data"
   outputDest: "globus://endpoint-id/path/to/output"
   stageOut: "true"

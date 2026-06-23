@@ -17,9 +17,9 @@ spec:
         app: {{ .Values.statefulset.name }}
       annotations:
         nersc.slurm/account: "{{ .Values.statefulset.account }}"
-        nersc.sf/tokenSecretName: "{{ .Values.statefulset.tokenSecretName }}"
-{{- with .Values.statefulset.tokenSecretKey }}
-        nersc.sf/tokenSecretKey: "{{ . }}"
+        nersc.sf/credentialSecretName: "{{ .Values.statefulset.credentialSecretName }}"
+{{- with .Values.statefulset.credentialSecretKey }}
+        nersc.sf/credentialSecretKey: "{{ . }}"
 {{- end }}
         nersc.sf/inputSource: "{{ .Values.statefulset.inputSource }}"
 {{- with .Values.statefulset.inputVolume }}

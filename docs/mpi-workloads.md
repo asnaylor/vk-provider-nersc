@@ -18,7 +18,7 @@ metadata:
   name: gpu-rank-test
   annotations:
     nersc.slurm/account: "m1234"
-    nersc.sf/tokenSecretName: "sf-api-token"
+    nersc.sf/credentialSecretName: "sfapi-client"
     nersc.slurm/nodes: "2"
     nersc.slurm/ntasks: "8"
     nersc.slurm/tasks-per-node: "4"

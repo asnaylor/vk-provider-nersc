@@ -32,8 +32,8 @@ statefulset:
   name: hpc-stateful
   replicas: 2
   account: m1234
-  tokenSecretName: sf-api-token
-  tokenSecretKey: token
+  credentialSecretName: sfapi-client
+  credentialSecretKey: sf_api.json
   inputSource: "globus://endpoint-id/path/to/data"
   inputVolume: data
   outputDest: "globus://endpoint-id/path/to/output"

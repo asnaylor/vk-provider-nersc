@@ -203,7 +203,7 @@ func TestCreatePodIsIdempotentForTrackedPod(t *testing.T) {
 	client := &fakeJobClient{submitJobID: "job-2"}
 	pod := testPod()
 	provider := newTestProvider(client)
-	provider.podMap[podKey(pod)] = podJobState{jobID: "job-1", token: "job-token"}
+	provider.podMap[podKey(pod)] = podJobState{jobID: "job-1", pod: pod.DeepCopy()}
 
 	if err := provider.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod returned error: %v", err)
@@ -218,7 +218,7 @@ func TestDeletePodKeepsTrackingWhenCancelFails(t *testing.T) {
 	client := &fakeJobClient{cancelErr: cancelErr}
 	pod := testPod()
 	provider := newTestProvider(client)
-	provider.podMap[podKey(pod)] = podJobState{jobID: "job-1", token: "job-token"}
+	provider.podMap[podKey(pod)] = podJobState{jobID: "job-1", pod: pod.DeepCopy()}
 
 	err := provider.DeletePod(context.Background(), pod)
 	if !errors.Is(err, cancelErr) {

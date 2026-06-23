@@ -65,7 +65,7 @@ const (
 
 type podJobState struct {
 	jobID string
-	token string
+	pod   *corev1.Pod
 }
 
 type podStagingState struct {
@@ -217,7 +217,7 @@ func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		log.Printf("Pod %s was concurrently submitted as job %s; cancelled duplicate job %s", key, existing.jobID, jobID)
 		return nil
 	}
-	p.podMap[key] = podJobState{jobID: jobID, token: token}
+	p.podMap[key] = podJobState{jobID: jobID, pod: pod.DeepCopy()}
 	if p.stagingMap == nil {
 		p.stagingMap = make(map[string]*podStagingState)
 	}
@@ -242,7 +242,7 @@ func (p *NerscProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 
 	key := podKey(pod)
 	if state, exists := p.jobStateForPodKey(key); exists {
-		client, err := p.clientForToken(state.token)
+		client, _, err := p.clientForPodState(ctx, key, state)
 		if err != nil {
 			return fmt.Errorf("create Superfacility client for pod %s: %w", key, err)
 		}
@@ -294,6 +294,21 @@ func (p *NerscProvider) clientForToken(token string) (jobClient, error) {
 	return p.sfClientFactory(token), nil
 }
 
+func (p *NerscProvider) clientForPodState(ctx context.Context, key string, state podJobState) (jobClient, string, error) {
+	if state.pod == nil {
+		return nil, "", fmt.Errorf("pod %s missing stored credential reference", key)
+	}
+	token, err := p.tokenForPod(ctx, state.pod)
+	if err != nil {
+		return nil, "", err
+	}
+	client, err := p.clientForToken(token)
+	if err != nil {
+		return nil, "", err
+	}
+	return client, token, nil
+}
+
 func (p *NerscProvider) jobIDForPodKey(key string) (string, bool) {
 	state, exists := p.jobStateForPodKey(key)
 	return state.jobID, exists
@@ -329,7 +344,7 @@ func (p *NerscProvider) GetPod(ctx context.Context, namespace, name string) (*co
 	if !exists {
 		return nil, fmt.Errorf("pod %s not found", key)
 	}
-	client, err := p.clientForToken(state.token)
+	client, token, err := p.clientForPodState(ctx, key, state)
 	if err != nil {
 		return nil, fmt.Errorf("create Superfacility client for pod %s: %w", key, err)
 	}
@@ -339,7 +354,7 @@ func (p *NerscProvider) GetPod(ctx context.Context, namespace, name string) (*co
 		return nil, err
 	}
 
-	podStatus := p.podStatusForJob(ctx, key, state.token, mapJobStatusToPodPhase(status))
+	podStatus := p.podStatusForJob(ctx, key, token, mapJobStatusToPodPhase(status))
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -377,7 +392,7 @@ func (p *NerscProvider) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 		}
 		namespace, name := parts[0], parts[1]
 
-		client, err := p.clientForToken(state.token)
+		client, token, err := p.clientForPodState(ctx, key, state)
 		if err != nil {
 			log.Printf("Failed to create Superfacility client for pod %s: %v", key, err)
 			continue
@@ -393,7 +408,7 @@ func (p *NerscProvider) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 				Name:      name,
 				Namespace: namespace,
 			},
-			Status: p.podStatusForJob(ctx, key, state.token, mapJobStatusToPodPhase(status)),
+			Status: p.podStatusForJob(ctx, key, token, mapJobStatusToPodPhase(status)),
 		}
 		pods = append(pods, pod)
 	}
@@ -420,7 +435,7 @@ func (p *NerscProvider) GetPodLogs(ctx context.Context, namespace, name, contain
 	if !exists {
 		return nil, fmt.Errorf("pod %s not found", key)
 	}
-	client, err := p.clientForToken(state.token)
+	client, _, err := p.clientForPodState(ctx, key, state)
 	if err != nil {
 		return nil, fmt.Errorf("create Superfacility client for pod %s: %w", key, err)
 	}
