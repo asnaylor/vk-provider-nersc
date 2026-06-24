@@ -43,6 +43,8 @@ statefulset:
   account: m9999
   credentialSecretName: sfapi-client
   credentialSecretKey: sf_api.json
+  transferMode: globus
+  scratchBase: ""
   inputSource: ""
   inputVolume: data
   outputDest: ""

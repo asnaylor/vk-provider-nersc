@@ -399,14 +399,15 @@ spec:
 
 ## PVC Integration & Optional Data Staging
 
-By default, workloads run directly against their Perlmutter scratch paths and no Globus transfer is started. This is the right mode when inputs already exist on scratch and outputs should remain there.
+By default, workloads run directly against their Perlmutter scratch paths and no data transfer is started. This is the right mode when inputs already exist on scratch and outputs should remain there.
 
-Add pod annotations to opt into Globus stage-in/out:
+Add pod annotations to opt into stage-in/out. `nersc.sf/transferMode` defaults to `globus`, which is the best fit for directory-scale endpoint-to-endpoint transfers:
 
 ```yaml
 metadata:
   annotations:
     nersc.sf/credentialSecretName: "sfapi-client"
+    nersc.sf/transferMode: "globus"
     nersc.sf/inputSource: "globus://endpoint-id/path/to/input"
     nersc.sf/outputDest: "globus://endpoint-id/path/to/output"
     nersc.sf/stageOut: "true"
@@ -422,14 +423,31 @@ Globus URIs use the form `globus://<endpoint>/<absolute/path>`. The endpoint can
 
 The workload's Superfacility API client credentials must have the optional Globus capability enabled. If staging annotations are present but Globus is not enabled for that SFAPI client, stage-in fails before compute submission or stage-out marks the pod failed with the transfer error.
 
+Set `nersc.sf/transferMode: "sfapi"` to use the Superfacility API file utilities instead of Globus. This mode supports single-file upload/download between a provider-local directory and Perlmutter, so the provider deployment must set `SFAPI_TRANSFER_LOCAL_ROOT` through the Helm `sfapiTransferLocalRoot` value and mount any shared Airflow/provider volume at that path. Because SFAPI utility paths are concrete remote filesystem paths, `nersc.sf/scratchBase` must also be set to an absolute NERSC path such as `/pscratch/sd/a/alice/vk-provider-nersc`; `$SCRATCH` shell expansion is not available to the upload/download API.
+
+```yaml
+metadata:
+  annotations:
+    nersc.sf/credentialSecretName: "sfapi-client"
+    nersc.sf/transferMode: "sfapi"
+    nersc.sf/scratchBase: "/pscratch/sd/a/alice/vk-provider-nersc"
+    nersc.sf/inputSource: "inputs/config.json"
+    nersc.sf/outputDest: "outputs/result.json"
+    nersc.sf/stageOut: "true"
+```
+
+In SFAPI mode, `inputSource` and `outputDest` are paths under `SFAPI_TRANSFER_LOCAL_ROOT`. Stage-in creates the selected remote scratch directory, uploads the input file using the same basename, and stage-out downloads the matching file from the selected scratch volume back under `SFAPI_TRANSFER_LOCAL_ROOT`.
+
 ### Staging annotations
 
 | Annotation | Required | Description |
 | --- | --- | --- |
 | `nersc.sf/credentialSecretName` | Yes | Kubernetes Secret in the workload namespace containing SFAPI client credentials for this pod. |
 | `nersc.sf/credentialSecretKey` | No | Secret data key containing `{"client_id": "...", "secret": {...}}`; defaults to `sf_api.json`. |
-| `nersc.sf/inputSource` | No | Globus source URI to stage into Perlmutter scratch before submitting the Slurm job. |
-| `nersc.sf/outputDest` | Required when `stageOut` is `true` | Globus destination URI for output staging after successful job completion. |
+| `nersc.sf/transferMode` | No | `globus` (default) or `sfapi`. |
+| `nersc.sf/scratchBase` | Required for `transferMode=sfapi` | Concrete absolute NERSC base path for per-pod scratch staging. Defaults to `$SCRATCH/vk-provider-nersc` for non-SFAPI modes. |
+| `nersc.sf/inputSource` | No | In Globus mode, a `globus://` source URI. In SFAPI mode, a provider-local file path under `SFAPI_TRANSFER_LOCAL_ROOT`. |
+| `nersc.sf/outputDest` | Required when `stageOut` is `true` | In Globus mode, a `globus://` destination URI. In SFAPI mode, a provider-local destination file path under `SFAPI_TRANSFER_LOCAL_ROOT`. |
 | `nersc.sf/stageOut` | No | Set to `true` to enable output staging. |
 | `nersc.sf/inputVolume` | Required for input staging with multiple volumes | Volume name whose scratch path should receive staged input. |
 | `nersc.sf/outputVolume` | Required for output staging with multiple volumes | Volume name whose scratch path should supply staged output. |

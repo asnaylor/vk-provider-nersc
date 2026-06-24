@@ -13,6 +13,10 @@ vkNodeName: "perlmutter-vk"
 
 kubeletPort: 10250
 
+# Provider-local root for SFAPI utilities transfer mode. Mount a shared volume
+# here before using nersc.sf/transferMode=sfapi.
+sfapiTransferLocalRoot: ""
+
 serviceAccount:
   name: vk-nersc
 
@@ -36,6 +40,8 @@ statefulset:
   account: m1234
   credentialSecretName: sfapi-client
   credentialSecretKey: sf_api.json
+  transferMode: globus
+  scratchBase: ""
   inputSource: "globus://endpoint-id/path/to/data"
   inputVolume: data
   outputDest: "globus://endpoint-id/path/to/output"

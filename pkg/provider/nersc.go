@@ -26,6 +26,7 @@ type NerscProvider struct {
 	tokenResolver        TokenResolver
 	nodeName             string
 	nodeAddress          string
+	localTransferRoot    string
 	transferPollInterval time.Duration
 	transferTimeout      time.Duration
 	mu                   sync.RWMutex
@@ -40,6 +41,9 @@ type jobClient interface {
 	GetJobStatus(context.Context, string) (string, error)
 	CancelJob(context.Context, string) error
 	FetchJobLogs(context.Context, string) (string, error)
+	UploadFile(context.Context, string, string, string, io.Reader) error
+	RunCommand(context.Context, string, string) (string, error)
+	DownloadFile(context.Context, string, string) ([]byte, error)
 	StartGlobusTransfer(context.Context, superfacility.GlobusTransferRequest) (superfacility.GlobusTransfer, error)
 	CheckGlobusTransfer(context.Context, string) (superfacility.GlobusTransferResult, error)
 }
@@ -58,6 +62,8 @@ const (
 	annotationInputSource     = "nersc.sf/inputSource"
 	annotationOutputDest      = "nersc.sf/outputDest"
 	annotationStageOut        = "nersc.sf/stageOut"
+	annotationTransferMode    = "nersc.sf/transferMode"
+	annotationScratchBase     = "nersc.sf/scratchBase"
 	annotationStageVolume     = "nersc.sf/stageVolume"
 	annotationInputVolume     = "nersc.sf/inputVolume"
 	annotationOutputVolume    = "nersc.sf/outputVolume"
@@ -70,16 +76,28 @@ type podJobState struct {
 }
 
 type podStagingState struct {
+	transferMode     stagingTransferMode
 	inputTransferID  string
 	inputSource      *globusLocation
+	inputLocalPath   string
 	inputTargetDir   string
+	inputTargetPath  string
 	outputTransferID string
 	outputStatus     transferStatus
 	outputError      string
 	outputRequest    *superfacility.GlobusTransferRequest
 	outputDest       *globusLocation
+	outputLocalPath  string
 	outputSourceDir  string
+	outputSourcePath string
 }
+
+type stagingTransferMode string
+
+const (
+	stagingTransferModeGlobus stagingTransferMode = "globus"
+	stagingTransferModeSFAPI  stagingTransferMode = "sfapi"
+)
 
 type transferStatus string
 
@@ -135,6 +153,13 @@ func (p *NerscProvider) SetNodeAddress(address string) {
 	}
 }
 
+func (p *NerscProvider) SetLocalTransferRoot(root string) {
+	root = strings.TrimSpace(root)
+	if root != "" {
+		p.localTransferRoot = root
+	}
+}
+
 func VirtualNodeLabels(nodeName string) map[string]string {
 	return map[string]string{
 		"type":                   "virtual-kubelet",
@@ -170,11 +195,16 @@ func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 
 	ssName, ordinal := detectStatefulSet(pod)
 
+	scratchRoot := getAnnotation(pod, annotationScratchBase)
+	if scratchRoot == "" {
+		scratchRoot = "$SCRATCH/vk-provider-nersc"
+	}
+
 	var jobScratchBase string
 	if ssName != "" {
-		jobScratchBase = path.Join("$SCRATCH", "vk-provider-nersc", ssName, strconv.Itoa(ordinal))
+		jobScratchBase = path.Join(scratchRoot, ssName, strconv.Itoa(ordinal))
 	} else {
-		jobScratchBase = path.Join("$SCRATCH", "vk-provider-nersc", pod.Name)
+		jobScratchBase = path.Join(scratchRoot, pod.Name)
 	}
 
 	volumeScratchPaths := make(map[string]string)
@@ -187,19 +217,10 @@ func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if err != nil {
 		return err
 	}
-	if staging != nil && staging.inputSource != nil {
-		transferID, err := p.startAndWaitForTransfer(ctx, client, superfacility.GlobusTransferRequest{
-			SourceUUID: staging.inputSource.Endpoint,
-			TargetUUID: "perlmutter",
-			SourceDir:  staging.inputSource.Path,
-			TargetDir:  staging.inputTargetDir,
-			Username:   getAnnotation(pod, annotationGlobusUsername),
-		})
-		if err != nil {
-			return fmt.Errorf("stage input for pod %s: %w", key, err)
+	if staging != nil {
+		if err := p.stageInput(ctx, client, key, staging, pod); err != nil {
+			return err
 		}
-		staging.inputTransferID = transferID
-		log.Printf("Pod %s input staged with Globus transfer %s", key, transferID)
 	}
 
 	var script string
@@ -438,7 +459,7 @@ func (p *NerscProvider) podStatusForJob(ctx context.Context, key, token string, 
 	}
 
 	staging := p.stagingForPodKey(key)
-	if staging == nil || staging.outputRequest == nil {
+	if staging == nil || !staging.hasStageOut() {
 		return status
 	}
 

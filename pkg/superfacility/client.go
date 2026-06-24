@@ -1,11 +1,13 @@
 package superfacility
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"path"
@@ -54,6 +56,12 @@ type taskResponse struct {
 	Result string `json:"result"`
 }
 
+type commandResponse struct {
+	TaskID string `json:"task_id"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
+}
+
 type jobOutputResponse struct {
 	Status string              `json:"status"`
 	Output []map[string]string `json:"output"`
@@ -65,6 +73,13 @@ type fileDownloadResponse struct {
 	File     string `json:"file"`
 	Error    string `json:"error"`
 	IsBinary bool   `json:"is_binary"`
+}
+
+type fileUploadResponse struct {
+	Status string `json:"status"`
+	Error  string `json:"error"`
+	File   string `json:"file"`
+	Path   string `json:"path"`
 }
 
 type GlobusTransferRequest struct {
@@ -240,6 +255,33 @@ func (c *Client) getTask(ctx context.Context, taskID string) (taskResponse, erro
 	return out, nil
 }
 
+func (c *Client) waitForTask(ctx context.Context, taskID string) (taskResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	poll := time.NewTicker(2 * time.Second)
+	defer poll.Stop()
+
+	for {
+		task, err := c.getTask(ctx, taskID)
+		if err != nil {
+			return taskResponse{}, err
+		}
+		switch strings.ToLower(strings.TrimSpace(task.Status)) {
+		case "completed":
+			return task, nil
+		case "failed", "cancelled", "canceled":
+			return taskResponse{}, fmt.Errorf("task %s failed: %s", taskID, task.Result)
+		}
+
+		select {
+		case <-ctx.Done():
+			return taskResponse{}, ctx.Err()
+		case <-poll.C:
+		}
+	}
+}
+
 func (c *Client) getComputeJobStatus(ctx context.Context, machine, jobID string) (string, error) {
 	out, err := c.getComputeJobOutput(ctx, machine, jobID)
 	if err != nil {
@@ -350,37 +392,161 @@ func (c *Client) FetchJobLogs(ctx context.Context, jobID string) (string, error)
 	return c.downloadTextFile(ctx, machine, stdoutPath)
 }
 
-func (c *Client) downloadTextFile(ctx context.Context, machine, remotePath string) (string, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("utilities/download/%s/%s", url.PathEscape(machine), escapeRemotePath(remotePath)), nil)
-	if err != nil {
-		return "", err
+func (c *Client) UploadFile(ctx context.Context, machine, remotePath, filename string, contents io.Reader) error {
+	machine = strings.TrimSpace(machine)
+	remotePath = strings.TrimSpace(remotePath)
+	filename = strings.TrimSpace(filename)
+	if machine == "" {
+		return fmt.Errorf("machine is required")
 	}
+	if remotePath == "" {
+		return fmt.Errorf("remote path is required")
+	}
+	if filename == "" {
+		filename = path.Base(remotePath)
+	}
+	if contents == nil {
+		return fmt.Errorf("file contents are required")
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return fmt.Errorf("create upload file part: %w", err)
+	}
+	if _, err := io.Copy(part, contents); err != nil {
+		return fmt.Errorf("copy upload file contents: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("close upload multipart body: %w", err)
+	}
+
+	req, err := c.newRequest(ctx, http.MethodPut, fmt.Sprintf("utilities/upload/%s/%s", url.PathEscape(machine), escapeRemotePath(remotePath)), &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("download file request: %w", err)
+		return fmt.Errorf("upload file request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("upload file failed: %s", responseError(resp))
+	}
+
+	var out fileUploadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("decode file upload response: %w", err)
+	}
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return fmt.Errorf("upload file failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	return nil
+}
+
+func (c *Client) RunCommand(ctx context.Context, machine, executable string) (string, error) {
+	machine = strings.TrimSpace(machine)
+	executable = strings.TrimSpace(executable)
+	if machine == "" {
+		return "", fmt.Errorf("machine is required")
+	}
+	if executable == "" {
+		return "", fmt.Errorf("executable is required")
+	}
+
+	form := url.Values{}
+	form.Set("executable", executable)
+
+	req, err := c.newRequest(ctx, http.MethodPost, fmt.Sprintf("utilities/command/%s", url.PathEscape(machine)), strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("run command request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download file failed: %s", responseError(resp))
+		return "", fmt.Errorf("run command failed: %s", responseError(resp))
+	}
+
+	var out commandResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode command response: %w", err)
+	}
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return "", fmt.Errorf("run command failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	if out.TaskID == "" {
+		return "", fmt.Errorf("run command response missing task_id")
+	}
+
+	task, err := c.waitForTask(ctx, out.TaskID)
+	if err != nil {
+		return "", err
+	}
+	return task.Result, nil
+}
+
+func (c *Client) DownloadFile(ctx context.Context, machine, remotePath string) ([]byte, error) {
+	return c.downloadFile(ctx, machine, remotePath, true)
+}
+
+func (c *Client) downloadTextFile(ctx context.Context, machine, remotePath string) (string, error) {
+	data, err := c.downloadFile(ctx, machine, remotePath, false)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (c *Client) downloadFile(ctx context.Context, machine, remotePath string, binary bool) ([]byte, error) {
+	machine = strings.TrimSpace(machine)
+	remotePath = strings.TrimSpace(remotePath)
+	if machine == "" {
+		return nil, fmt.Errorf("machine is required")
+	}
+	if remotePath == "" {
+		return nil, fmt.Errorf("remote path is required")
+	}
+
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("utilities/download/%s/%s?binary=%t", url.PathEscape(machine), escapeRemotePath(remotePath), binary), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download file request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download file failed: %s", responseError(resp))
 	}
 
 	var out fileDownloadResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("decode file download response: %w", err)
+		return nil, fmt.Errorf("decode file download response: %w", err)
 	}
 	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
-		return "", fmt.Errorf("download file failed: %s", firstNonEmpty(out.Error, out.Status))
+		return nil, fmt.Errorf("download file failed: %s", firstNonEmpty(out.Error, out.Status))
 	}
 	if !out.IsBinary {
-		return out.File, nil
+		return []byte(out.File), nil
 	}
 	data, err := base64.StdEncoding.DecodeString(out.File)
 	if err != nil {
-		return "", fmt.Errorf("decode binary file download: %w", err)
+		return nil, fmt.Errorf("decode binary file download: %w", err)
 	}
-	return string(data), nil
+	return data, nil
 }
 
 func (c *Client) StartGlobusTransfer(ctx context.Context, req GlobusTransferRequest) (GlobusTransfer, error) {

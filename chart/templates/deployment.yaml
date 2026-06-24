@@ -30,6 +30,10 @@ spec:
               fieldPath: status.podIP
         - name: VK_KUBELET_LISTEN_ADDR
           value: ":{{ .Values.kubeletPort }}"
+{{- with .Values.sfapiTransferLocalRoot }}
+        - name: SFAPI_TRANSFER_LOCAL_ROOT
+          value: "{{ . }}"
+{{- end }}
 {{- with .Values.extraEnv }}
 {{- range . }}
         - name: {{ .name }}

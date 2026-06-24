@@ -2,6 +2,7 @@ package superfacility
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -142,6 +143,108 @@ func TestFetchJobLogsFallsBackToWorkdirAndJobName(t *testing.T) {
 	}
 	if logs != "demo logs\n" {
 		t.Fatalf("logs = %q", logs)
+	}
+}
+
+func TestUploadFileUsesUtilitiesEndpoint(t *testing.T) {
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("method = %s, want PUT", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/v1.2/utilities/upload/perlmutter//pscratch/sd/a/alice/input.txt" {
+			t.Fatalf("escaped upload path = %s", r.URL.EscapedPath())
+		}
+		if err := r.ParseMultipartForm(1024); err != nil {
+			t.Fatalf("parse multipart form: %v", err)
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			t.Fatalf("form file: %v", err)
+		}
+		defer file.Close()
+		if header.Filename != "input.txt" {
+			t.Fatalf("filename = %q, want input.txt", header.Filename)
+		}
+		data, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatalf("read upload file: %v", err)
+		}
+		if string(data) != "payload" {
+			t.Fatalf("upload contents = %q", data)
+		}
+		return response(http.StatusOK, `{"status":"OK","file":"/pscratch/sd/a/alice/input.txt"}`), nil
+	})
+
+	err := client.UploadFile(context.Background(), "perlmutter", "/pscratch/sd/a/alice/input.txt", "input.txt", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatalf("UploadFile returned error: %v", err)
+	}
+}
+
+func TestRunCommandSubmitsCommandAndWaitsForTask(t *testing.T) {
+	requests := 0
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", r.Method)
+			}
+			if r.URL.EscapedPath() != "/api/v1.2/utilities/command/perlmutter" {
+				t.Fatalf("escaped command path = %s", r.URL.EscapedPath())
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("parse command form: %v", err)
+			}
+			if got := r.PostForm.Get("executable"); got != "mkdir -p -- '/pscratch/demo'" {
+				t.Fatalf("executable = %q", got)
+			}
+			return response(http.StatusOK, `{"status":"OK","task_id":"task-123"}`), nil
+		case 2:
+			if r.Method != http.MethodGet {
+				t.Fatalf("method = %s, want GET", r.Method)
+			}
+			if r.URL.EscapedPath() != "/api/v1.2/tasks/task-123" {
+				t.Fatalf("escaped task path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"id":"task-123","status":"completed","result":"ok"}`), nil
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, r.URL.String())
+		}
+		return nil, nil
+	})
+
+	result, err := client.RunCommand(context.Background(), "perlmutter", "mkdir -p -- '/pscratch/demo'")
+	if err != nil {
+		t.Fatalf("RunCommand returned error: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("result = %q, want ok", result)
+	}
+}
+
+func TestDownloadFileRequestsBinaryData(t *testing.T) {
+	payload := []byte{0, 1, 2, 3}
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/v1.2/utilities/download/perlmutter//pscratch/sd/a/alice/output.bin" {
+			t.Fatalf("escaped download path = %s", r.URL.EscapedPath())
+		}
+		if r.URL.Query().Get("binary") != "true" {
+			t.Fatalf("binary query = %q, want true", r.URL.Query().Get("binary"))
+		}
+		body := fmt.Sprintf(`{"status":"OK","file":%q,"is_binary":true}`, base64.StdEncoding.EncodeToString(payload))
+		return response(http.StatusOK, body), nil
+	})
+
+	data, err := client.DownloadFile(context.Background(), "perlmutter", "/pscratch/sd/a/alice/output.bin")
+	if err != nil {
+		t.Fatalf("DownloadFile returned error: %v", err)
+	}
+	if string(data) != string(payload) {
+		t.Fatalf("download data = %v, want %v", data, payload)
 	}
 }
 

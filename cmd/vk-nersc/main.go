@@ -41,6 +41,7 @@ func main() {
 	}
 	nodeAddress := firstNonEmpty(os.Getenv("VK_NODE_IP"), os.Getenv("POD_IP"), "127.0.0.1")
 	kubeletListenAddr := firstNonEmpty(os.Getenv("VK_KUBELET_LISTEN_ADDR"), ":10250")
+	localTransferRoot := os.Getenv("SFAPI_TRANSFER_LOCAL_ROOT")
 
 	// Create Kubernetes client
 	config, err := rest.InClusterConfig()
@@ -66,6 +67,7 @@ func main() {
 		log.Fatalf("Failed to create provider: %v", err)
 	}
 	prov.SetNodeAddress(nodeAddress)
+	prov.SetLocalTransferRoot(localTransferRoot)
 
 	// Create the virtual node
 	virtualNode := &corev1.Node{

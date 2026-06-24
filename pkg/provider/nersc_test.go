@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -25,9 +27,20 @@ type fakeJobClient struct {
 	cancelledIDs    []string
 	logsByJob       map[string]string
 	operations      []string
+	commandReqs     []string
+	uploadReqs      []sfapiUploadRequest
+	downloadFiles   map[string][]byte
+	downloadReqs    []string
 	transferID      string
 	transferReqs    []superfacility.GlobusTransferRequest
 	transferResults map[string][]superfacility.GlobusTransferResult
+}
+
+type sfapiUploadRequest struct {
+	machine    string
+	remotePath string
+	filename   string
+	contents   string
 }
 
 func (f *fakeJobClient) SubmitJob(ctx context.Context, req superfacility.JobSubmissionRequest) (string, error) {
@@ -59,6 +72,39 @@ func (f *fakeJobClient) FetchJobLogs(ctx context.Context, jobID string) (string,
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.logsByJob[jobID], nil
+}
+
+func (f *fakeJobClient) UploadFile(ctx context.Context, machine, remotePath, filename string, contents io.Reader) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, err := io.ReadAll(contents)
+	if err != nil {
+		return err
+	}
+	f.operations = append(f.operations, "upload-file")
+	f.uploadReqs = append(f.uploadReqs, sfapiUploadRequest{
+		machine:    machine,
+		remotePath: remotePath,
+		filename:   filename,
+		contents:   string(data),
+	})
+	return nil
+}
+
+func (f *fakeJobClient) RunCommand(ctx context.Context, machine, executable string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.operations = append(f.operations, "run-command")
+	f.commandReqs = append(f.commandReqs, machine+":"+executable)
+	return "", nil
+}
+
+func (f *fakeJobClient) DownloadFile(ctx context.Context, machine, remotePath string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.operations = append(f.operations, "download-file")
+	f.downloadReqs = append(f.downloadReqs, machine+":"+remotePath)
+	return f.downloadFiles[remotePath], nil
 }
 
 func (f *fakeJobClient) StartGlobusTransfer(ctx context.Context, req superfacility.GlobusTransferRequest) (superfacility.GlobusTransfer, error) {
@@ -304,6 +350,50 @@ func TestCreatePodStagesInputBeforeSubmittingJob(t *testing.T) {
 	}
 }
 
+func TestCreatePodStagesInputWithSFAPITransferMode(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "input.txt"), []byte("payload"), 0o600); err != nil {
+		t.Fatalf("write input fixture: %v", err)
+	}
+
+	client := &fakeJobClient{submitJobID: "job-1"}
+	provider := newTestProvider(client)
+	provider.SetLocalTransferRoot(root)
+	pod := testPod()
+	pod.Annotations[annotationTransferMode] = string(stagingTransferModeSFAPI)
+	pod.Annotations[annotationScratchBase] = "/pscratch/sd/a/alice/vk-provider-nersc"
+	pod.Annotations[annotationInputSource] = "input.txt"
+	pod.Annotations[annotationInputVolume] = "data"
+	pod.Spec.Volumes = []corev1.Volume{{Name: "data"}, {Name: "work"}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/mnt/data"}}
+
+	if err := provider.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod returned error: %v", err)
+	}
+	if got, want := strings.Join(client.operations, ","), "run-command,upload-file,submit"; got != want {
+		t.Fatalf("operations = %s, want %s", got, want)
+	}
+	if len(client.commandReqs) != 1 || client.commandReqs[0] != `perlmutter:bash -c 'mkdir -p -- '"'"'/pscratch/sd/a/alice/vk-provider-nersc/demo/data'"'"''` {
+		t.Fatalf("command requests = %+v", client.commandReqs)
+	}
+	if len(client.uploadReqs) != 1 {
+		t.Fatalf("upload request count = %d, want 1", len(client.uploadReqs))
+	}
+	req := client.uploadReqs[0]
+	if req.machine != "perlmutter" {
+		t.Fatalf("machine = %q, want perlmutter", req.machine)
+	}
+	if req.remotePath != "/pscratch/sd/a/alice/vk-provider-nersc/demo/data/input.txt" {
+		t.Fatalf("remote path = %q", req.remotePath)
+	}
+	if req.filename != "input.txt" {
+		t.Fatalf("filename = %q", req.filename)
+	}
+	if req.contents != "payload" {
+		t.Fatalf("contents = %q", req.contents)
+	}
+}
+
 func TestGetPodStatusStagesOutputAfterJobSucceeds(t *testing.T) {
 	t.Setenv("USER", "alice")
 
@@ -345,6 +435,51 @@ func TestGetPodStatusStagesOutputAfterJobSucceeds(t *testing.T) {
 	}
 	if req.TargetDir != "/global/cfs/cdirs/m1234/output" {
 		t.Fatalf("target dir = %q", req.TargetDir)
+	}
+}
+
+func TestGetPodStatusStagesOutputWithSFAPITransferMode(t *testing.T) {
+	root := t.TempDir()
+	client := &fakeJobClient{
+		submitJobID: "job-1",
+		statusByJob: map[string]string{"job-1": "completed"},
+		downloadFiles: map[string][]byte{
+			"/pscratch/sd/a/alice/vk-provider-nersc/demo/results/output.txt": []byte("result"),
+		},
+	}
+	provider := newTestProvider(client)
+	provider.SetLocalTransferRoot(root)
+	pod := testPod()
+	pod.Annotations[annotationTransferMode] = string(stagingTransferModeSFAPI)
+	pod.Annotations[annotationScratchBase] = "/pscratch/sd/a/alice/vk-provider-nersc"
+	pod.Annotations[annotationStageOut] = "true"
+	pod.Annotations[annotationOutputDest] = "outputs/output.txt"
+	pod.Annotations[annotationOutputVolume] = "results"
+	pod.Spec.Volumes = []corev1.Volume{{Name: "data"}, {Name: "results"}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "results", MountPath: "/mnt/results"}}
+
+	if err := provider.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod returned error: %v", err)
+	}
+	status, err := provider.GetPodStatus(context.Background(), pod.Namespace, pod.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus returned error: %v", err)
+	}
+	if status.Phase != corev1.PodSucceeded || status.Reason != "StageOutComplete" {
+		t.Fatalf("status = %s/%s, want Succeeded/StageOutComplete", status.Phase, status.Reason)
+	}
+	if got, want := strings.Join(client.operations, ","), "submit,download-file"; got != want {
+		t.Fatalf("operations = %s, want %s", got, want)
+	}
+	if len(client.downloadReqs) != 1 || client.downloadReqs[0] != "perlmutter:/pscratch/sd/a/alice/vk-provider-nersc/demo/results/output.txt" {
+		t.Fatalf("download requests = %+v", client.downloadReqs)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "outputs", "output.txt"))
+	if err != nil {
+		t.Fatalf("read staged output: %v", err)
+	}
+	if string(data) != "result" {
+		t.Fatalf("staged output = %q", data)
 	}
 }
 
