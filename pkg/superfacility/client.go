@@ -2,11 +2,13 @@ package superfacility
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -56,6 +58,13 @@ type jobOutputResponse struct {
 	Status string              `json:"status"`
 	Output []map[string]string `json:"output"`
 	Error  string              `json:"error"`
+}
+
+type fileDownloadResponse struct {
+	Status   string `json:"status"`
+	File     string `json:"file"`
+	Error    string `json:"error"`
+	IsBinary bool   `json:"is_binary"`
 }
 
 type GlobusTransferRequest struct {
@@ -232,32 +241,40 @@ func (c *Client) getTask(ctx context.Context, taskID string) (taskResponse, erro
 }
 
 func (c *Client) getComputeJobStatus(ctx context.Context, machine, jobID string) (string, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("compute/jobs/%s/%s?sacct=true&cached=false", url.PathEscape(machine), url.PathEscape(jobID)), nil)
+	out, err := c.getComputeJobOutput(ctx, machine, jobID)
 	if err != nil {
 		return "", err
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("get job status request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status failed: %s", responseError(resp))
-	}
-
-	var out jobOutputResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("decode status response: %w", err)
-	}
-	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
-		return "", fmt.Errorf("status failed: %s", firstNonEmpty(out.Error, out.Status))
 	}
 	if status := statusFromJobOutput(out.Output); status != "" {
 		return status, nil
 	}
 	return "pending", nil
+}
+
+func (c *Client) getComputeJobOutput(ctx context.Context, machine, jobID string) (jobOutputResponse, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("compute/jobs/%s/%s?sacct=true&cached=false", url.PathEscape(machine), url.PathEscape(jobID)), nil)
+	if err != nil {
+		return jobOutputResponse{}, err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return jobOutputResponse{}, fmt.Errorf("get job status request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return jobOutputResponse{}, fmt.Errorf("status failed: %s", responseError(resp))
+	}
+
+	var out jobOutputResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return jobOutputResponse{}, fmt.Errorf("decode status response: %w", err)
+	}
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return jobOutputResponse{}, fmt.Errorf("status failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	return out, nil
 }
 
 func (c *Client) CancelJob(ctx context.Context, jobID string) error {
@@ -301,23 +318,67 @@ func (c *Client) cancelTask(ctx context.Context, taskID string) error {
 }
 
 func (c *Client) FetchJobLogs(ctx context.Context, jobID string) (string, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("jobs/%s/logs", url.PathEscape(jobID)), nil)
+	machine := "perlmutter"
+	slurmJobID := jobID
+	if taskMachine, taskID, ok := parseTaskJobRef(jobID); ok {
+		machine = taskMachine
+		task, err := c.getTask(ctx, taskID)
+		if err != nil {
+			return "", err
+		}
+		switch strings.ToLower(strings.TrimSpace(task.Status)) {
+		case "completed":
+			slurmJobID = extractSlurmJobID(task.Result)
+			if slurmJobID == "" {
+				return task.Result, nil
+			}
+		case "failed", "cancelled", "canceled":
+			return task.Result, nil
+		default:
+			return "", nil
+		}
+	}
+
+	out, err := c.getComputeJobOutput(ctx, machine, slurmJobID)
+	if err != nil {
+		return "", err
+	}
+	stdoutPath := stdoutPathFromJobOutput(out.Output)
+	if stdoutPath == "" {
+		return "", fmt.Errorf("job %s did not include a stdout path", slurmJobID)
+	}
+	return c.downloadTextFile(ctx, machine, stdoutPath)
+}
+
+func (c *Client) downloadTextFile(ctx context.Context, machine, remotePath string) (string, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("utilities/download/%s/%s", url.PathEscape(machine), escapeRemotePath(remotePath)), nil)
 	if err != nil {
 		return "", err
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetch job logs request: %w", err)
+		return "", fmt.Errorf("download file request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("logs failed: %s", responseError(resp))
+		return "", fmt.Errorf("download file failed: %s", responseError(resp))
 	}
-	data, err := io.ReadAll(resp.Body)
+
+	var out fileDownloadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode file download response: %w", err)
+	}
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return "", fmt.Errorf("download file failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	if !out.IsBinary {
+		return out.File, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(out.File)
 	if err != nil {
-		return "", fmt.Errorf("read logs response: %w", err)
+		return "", fmt.Errorf("decode binary file download: %w", err)
 	}
 	return string(data), nil
 }
@@ -472,6 +533,49 @@ func statusFromJobOutput(rows []map[string]string) string {
 		}
 	}
 	return ""
+}
+
+func stdoutPathFromJobOutput(rows []map[string]string) string {
+	for _, row := range rows {
+		for _, key := range []string{"stdout", "StdOut", "stdoutpath", "stdoutPath", "StdoutPath"} {
+			if value := strings.TrimSpace(row[key]); value != "" {
+				return value
+			}
+		}
+		if adminComment := strings.TrimSpace(firstNonEmpty(row["admincomment"], row["AdminComment"])); adminComment != "" {
+			var comment struct {
+				StdoutPath string `json:"stdoutPath"`
+			}
+			if err := json.Unmarshal([]byte(adminComment), &comment); err == nil && strings.TrimSpace(comment.StdoutPath) != "" {
+				return strings.TrimSpace(comment.StdoutPath)
+			}
+		}
+		workdir := strings.TrimSpace(firstNonEmpty(row["workdir"], row["WorkDir"]))
+		jobName := strings.TrimSpace(firstNonEmpty(row["jobname"], row["JobName"]))
+		if workdir != "" && jobName != "" {
+			return path.Join(workdir, jobName+".out")
+		}
+	}
+	return ""
+}
+
+func escapeRemotePath(remotePath string) string {
+	remotePath = strings.TrimSpace(remotePath)
+	if remotePath == "" {
+		return ""
+	}
+
+	prefix := ""
+	if strings.HasPrefix(remotePath, "/") {
+		prefix = "/"
+		remotePath = strings.TrimLeft(remotePath, "/")
+	}
+
+	parts := strings.Split(remotePath, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return prefix + strings.Join(parts, "/")
 }
 
 func normalizeSlurmStatus(status string) string {

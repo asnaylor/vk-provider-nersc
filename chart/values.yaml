@@ -11,6 +11,8 @@ sfApiEndpoint: "https://api.nersc.gov/api/v1.2"
 
 vkNodeName: "perlmutter-vk"
 
+kubeletPort: 10250
+
 serviceAccount:
   name: vk-nersc
 

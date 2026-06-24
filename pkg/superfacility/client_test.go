@@ -82,6 +82,69 @@ func TestGetJobStatusPollsTaskAndSlurmJob(t *testing.T) {
 	}
 }
 
+func TestFetchJobLogsDownloadsTaskBackedSlurmStdout(t *testing.T) {
+	requests := 0
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			if r.URL.EscapedPath() != "/api/v1.2/tasks/task%2F123" {
+				t.Fatalf("escaped task path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"id":"task/123","status":"completed","result":"{\"status\":\"ok\",\"jobid\":\"98765\",\"error\":null}"}`), nil
+		case 2:
+			if r.URL.EscapedPath() != "/api/v1.2/compute/jobs/perlmutter/98765" {
+				t.Fatalf("escaped job path = %s", r.URL.EscapedPath())
+			}
+			body := `{"status":"OK","output":[{"state":"COMPLETED","admincomment":"{\"stdoutPath\":\"/global/u2/a/asnaylor/perlmutter-smoke.out\"}"}]}`
+			return response(http.StatusOK, body), nil
+		case 3:
+			if r.URL.EscapedPath() != "/api/v1.2/utilities/download/perlmutter//global/u2/a/asnaylor/perlmutter-smoke.out" {
+				t.Fatalf("escaped download path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"status":"OK","file":"hello from perlmutter\n","error":null,"is_binary":false}`), nil
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, r.URL.String())
+		}
+		return nil, nil
+	})
+
+	logs, err := client.FetchJobLogs(context.Background(), makeTaskJobRef("perlmutter", "task/123"))
+	if err != nil {
+		t.Fatalf("FetchJobLogs returned error: %v", err)
+	}
+	if logs != "hello from perlmutter\n" {
+		t.Fatalf("logs = %q", logs)
+	}
+}
+
+func TestFetchJobLogsFallsBackToWorkdirAndJobName(t *testing.T) {
+	requests := 0
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			return response(http.StatusOK, `{"status":"OK","output":[{"state":"COMPLETED","workdir":"/global/u2/a/asnaylor","jobname":"demo"}]}`), nil
+		case 2:
+			if r.URL.EscapedPath() != "/api/v1.2/utilities/download/perlmutter//global/u2/a/asnaylor/demo.out" {
+				t.Fatalf("escaped download path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"status":"OK","file":"demo logs\n","is_binary":false}`), nil
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, r.URL.String())
+		}
+		return nil, nil
+	})
+
+	logs, err := client.FetchJobLogs(context.Background(), "98765")
+	if err != nil {
+		t.Fatalf("FetchJobLogs returned error: %v", err)
+	}
+	if logs != "demo logs\n" {
+		t.Fatalf("logs = %q", logs)
+	}
+}
+
 func TestClientErrorIncludesStatusAndBody(t *testing.T) {
 	client := newTestClient(func(r *http.Request) (*http.Response, error) {
 		return response(http.StatusUnauthorized, "bad token\n"), nil

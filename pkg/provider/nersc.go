@@ -25,6 +25,7 @@ type NerscProvider struct {
 	sfClientFactory      jobClientFactory
 	tokenResolver        TokenResolver
 	nodeName             string
+	nodeAddress          string
 	transferPollInterval time.Duration
 	transferTimeout      time.Duration
 	mu                   sync.RWMutex
@@ -119,11 +120,19 @@ func NewNerscProvider(endpoint, nodeName string, tokenResolver TokenResolver) (*
 		sfClientFactory:      func(token string) jobClient { return superfacility.New(endpoint, token) },
 		tokenResolver:        tokenResolver,
 		nodeName:             nodeName,
+		nodeAddress:          "127.0.0.1",
 		transferPollInterval: defaultTransferPollInterval,
 		transferTimeout:      defaultTransferTimeout,
 		podMap:               make(map[string]podJobState),
 		stagingMap:           make(map[string]*podStagingState),
 	}, nil
+}
+
+func (p *NerscProvider) SetNodeAddress(address string) {
+	address = strings.TrimSpace(address)
+	if address != "" {
+		p.nodeAddress = address
+	}
 }
 
 func VirtualNodeLabels(nodeName string) map[string]string {
@@ -477,10 +486,14 @@ func (p *NerscProvider) NodeConditions(ctx context.Context) []corev1.NodeConditi
 }
 
 func (p *NerscProvider) NodeAddresses(ctx context.Context) []corev1.NodeAddress {
+	address := strings.TrimSpace(p.nodeAddress)
+	if address == "" {
+		address = "127.0.0.1"
+	}
 	return []corev1.NodeAddress{
 		{
 			Type:    corev1.NodeInternalIP,
-			Address: "127.0.0.1",
+			Address: address,
 		},
 		{
 			Type:    corev1.NodeHostName,
