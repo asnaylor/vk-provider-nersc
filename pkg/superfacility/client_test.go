@@ -2,7 +2,6 @@ package superfacility
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,22 +14,26 @@ func TestSubmitJobSendsRequestAndDecodesJobID(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/api/v1.2/jobs" {
-			t.Fatalf("path = %s, want /api/v1.2/jobs", r.URL.Path)
+		if r.URL.Path != "/api/v1.2/compute/jobs/perlmutter" {
+			t.Fatalf("path = %s, want compute job submit path", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer token" {
 			t.Fatalf("authorization header = %q", got)
 		}
-
-		var req JobSubmissionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
+		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+			t.Fatalf("content type = %q", got)
 		}
-		if req.Script != "#!/bin/bash" || req.System != "perlmutter" || req.Project != "m1234" {
-			t.Fatalf("unexpected request body: %+v", req)
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		if got := r.PostForm.Get("job"); got != "#!/bin/bash" {
+			t.Fatalf("job form = %q", got)
+		}
+		if got := r.PostForm.Get("isPath"); got != "false" {
+			t.Fatalf("isPath form = %q", got)
 		}
 
-		return response(http.StatusCreated, `{"jobid":"12345"}`), nil
+		return response(http.StatusOK, `{"task_id":"task-123","status":"OK"}`), nil
 	})
 
 	jobID, err := client.SubmitJob(context.Background(), JobSubmissionRequest{
@@ -41,20 +44,36 @@ func TestSubmitJobSendsRequestAndDecodesJobID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubmitJob returned error: %v", err)
 	}
-	if jobID != "12345" {
-		t.Fatalf("jobID = %q, want 12345", jobID)
+	if jobID != makeTaskJobRef("perlmutter", "task-123") {
+		t.Fatalf("jobID = %q, want task-backed ref", jobID)
 	}
 }
 
-func TestGetJobStatusEscapesJobID(t *testing.T) {
+func TestGetJobStatusPollsTaskAndSlurmJob(t *testing.T) {
+	requests := 0
 	client := newTestClient(func(r *http.Request) (*http.Response, error) {
-		if r.URL.EscapedPath() != "/api/v1.2/jobs/job%2F123" {
-			t.Fatalf("escaped path = %s, want /api/v1.2/jobs/job%%2F123", r.URL.EscapedPath())
+		requests++
+		switch requests {
+		case 1:
+			if r.URL.EscapedPath() != "/api/v1.2/tasks/task%2F123" {
+				t.Fatalf("escaped task path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"id":"task/123","status":"completed","result":"Submitted batch job 98765"}`), nil
+		case 2:
+			if r.URL.EscapedPath() != "/api/v1.2/compute/jobs/perlmutter/98765" {
+				t.Fatalf("escaped job path = %s", r.URL.EscapedPath())
+			}
+			if r.URL.Query().Get("sacct") != "true" || r.URL.Query().Get("cached") != "false" {
+				t.Fatalf("query = %s, want sacct=true cached=false", r.URL.RawQuery)
+			}
+			return response(http.StatusOK, `{"status":"OK","output":[{"State":"RUNNING"}]}`), nil
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, r.URL.String())
 		}
-		return response(http.StatusOK, `{"status":"running"}`), nil
+		return nil, nil
 	})
 
-	status, err := client.GetJobStatus(context.Background(), "job/123")
+	status, err := client.GetJobStatus(context.Background(), makeTaskJobRef("perlmutter", "task/123"))
 	if err != nil {
 		t.Fatalf("GetJobStatus returned error: %v", err)
 	}
@@ -83,8 +102,8 @@ func TestSubmitJobRequiresJobID(t *testing.T) {
 	})
 
 	_, err := client.SubmitJob(context.Background(), JobSubmissionRequest{Script: "script", System: "perlmutter"})
-	if err == nil || !strings.Contains(err.Error(), "missing jobid") {
-		t.Fatalf("error = %v, want missing jobid", err)
+	if err == nil || !strings.Contains(err.Error(), "missing task_id") {
+		t.Fatalf("error = %v, want missing task_id", err)
 	}
 }
 

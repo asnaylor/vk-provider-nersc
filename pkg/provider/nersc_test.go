@@ -117,6 +117,17 @@ func newTestProvider(client *fakeJobClient) *NerscProvider {
 	}
 }
 
+func TestNodeStatusIncludesSchedulingLabels(t *testing.T) {
+	provider := newTestProvider(&fakeJobClient{})
+
+	node := provider.nodeStatus(context.Background())
+	for key, want := range VirtualNodeLabels("perlmutter-vk") {
+		if got := node.Labels[key]; got != want {
+			t.Fatalf("node label %s = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestNewNerscProviderValidatesConfig(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -288,7 +299,7 @@ func TestCreatePodStagesInputBeforeSubmittingJob(t *testing.T) {
 	if req.SourceDir != "/global/cfs/cdirs/m1234/input" {
 		t.Fatalf("source dir = %q", req.SourceDir)
 	}
-	if req.TargetDir != "/global/cscratch1/sd/alice/demo/data" {
+	if req.TargetDir != "$SCRATCH/vk-provider-nersc/demo/data" {
 		t.Fatalf("target dir = %q", req.TargetDir)
 	}
 }
@@ -329,7 +340,7 @@ func TestGetPodStatusStagesOutputAfterJobSucceeds(t *testing.T) {
 	if req.SourceUUID != "perlmutter" || req.TargetUUID != "dtn" {
 		t.Fatalf("endpoints = %s -> %s, want perlmutter -> dtn", req.SourceUUID, req.TargetUUID)
 	}
-	if req.SourceDir != "/global/cscratch1/sd/alice/demo/results" {
+	if req.SourceDir != "$SCRATCH/vk-provider-nersc/demo/results" {
 		t.Fatalf("source dir = %q", req.SourceDir)
 	}
 	if req.TargetDir != "/global/cfs/cdirs/m1234/output" {

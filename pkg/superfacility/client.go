@@ -1,18 +1,22 @@
 package superfacility
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const maxErrorBodyBytes = 4096
+
+const taskJobRefPrefix = "sfapi-task:"
+
+var slurmJobIDPattern = regexp.MustCompile(`\b[0-9]+(?:_[0-9]+)?\b`)
 
 type Client struct {
 	Endpoint string
@@ -36,7 +40,22 @@ type JobSubmissionRequest struct {
 }
 
 type JobSubmissionResponse struct {
-	JobID string `json:"jobid"`
+	JobID  string `json:"jobid"`
+	TaskID string `json:"task_id"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
+}
+
+type taskResponse struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Result string `json:"result"`
+}
+
+type jobOutputResponse struct {
+	Status string              `json:"status"`
+	Output []map[string]string `json:"output"`
+	Error  string              `json:"error"`
 }
 
 type GlobusTransferRequest struct {
@@ -121,16 +140,19 @@ func (r GlobusTransferResult) IsComplete() (bool, bool) {
 }
 
 func (c *Client) SubmitJob(ctx context.Context, req JobSubmissionRequest) (string, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return "", fmt.Errorf("marshal job submission: %w", err)
+	if strings.TrimSpace(req.System) == "" {
+		return "", fmt.Errorf("job submission system is required")
 	}
 
-	httpReq, err := c.newRequest(ctx, http.MethodPost, "jobs", bytes.NewReader(body))
+	form := url.Values{}
+	form.Set("job", req.Script)
+	form.Set("isPath", "false")
+
+	httpReq, err := c.newRequest(ctx, http.MethodPost, fmt.Sprintf("compute/jobs/%s", url.PathEscape(req.System)), strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
@@ -146,14 +168,71 @@ func (c *Client) SubmitJob(ctx context.Context, req JobSubmissionRequest) (strin
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("decode submit response: %w", err)
 	}
-	if out.JobID == "" {
-		return "", fmt.Errorf("submit response missing jobid")
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return "", fmt.Errorf("submit failed: %s", firstNonEmpty(out.Error, out.Status))
 	}
-	return out.JobID, nil
+	if out.JobID != "" {
+		return out.JobID, nil
+	}
+	if out.TaskID == "" {
+		return "", fmt.Errorf("submit response missing task_id")
+	}
+	return makeTaskJobRef(req.System, out.TaskID), nil
 }
 
 func (c *Client) GetJobStatus(ctx context.Context, jobID string) (string, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("jobs/%s", url.PathEscape(jobID)), nil)
+	if machine, taskID, ok := parseTaskJobRef(jobID); ok {
+		return c.getTaskBackedJobStatus(ctx, machine, taskID)
+	}
+	return c.getComputeJobStatus(ctx, "perlmutter", jobID)
+}
+
+func (c *Client) getTaskBackedJobStatus(ctx context.Context, machine, taskID string) (string, error) {
+	task, err := c.getTask(ctx, taskID)
+	if err != nil {
+		return "", err
+	}
+	switch strings.ToLower(strings.TrimSpace(task.Status)) {
+	case "new", "":
+		return "pending", nil
+	case "failed", "cancelled", "canceled":
+		return "failed", nil
+	case "completed":
+		slurmJobID := extractSlurmJobID(task.Result)
+		if slurmJobID == "" {
+			return "", fmt.Errorf("task %s completed but result did not contain a Slurm job id: %q", taskID, task.Result)
+		}
+		return c.getComputeJobStatus(ctx, machine, slurmJobID)
+	default:
+		return strings.ToLower(task.Status), nil
+	}
+}
+
+func (c *Client) getTask(ctx context.Context, taskID string) (taskResponse, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("tasks/%s", url.PathEscape(taskID)), nil)
+	if err != nil {
+		return taskResponse{}, err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return taskResponse{}, fmt.Errorf("get task request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return taskResponse{}, fmt.Errorf("task status failed: %s", responseError(resp))
+	}
+
+	var out taskResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return taskResponse{}, fmt.Errorf("decode task response: %w", err)
+	}
+	return out, nil
+}
+
+func (c *Client) getComputeJobStatus(ctx context.Context, machine, jobID string) (string, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("compute/jobs/%s/%s?sacct=true&cached=false", url.PathEscape(machine), url.PathEscape(jobID)), nil)
 	if err != nil {
 		return "", err
 	}
@@ -168,17 +247,25 @@ func (c *Client) GetJobStatus(ctx context.Context, jobID string) (string, error)
 		return "", fmt.Errorf("status failed: %s", responseError(resp))
 	}
 
-	var out struct {
-		Status string `json:"status"`
-	}
+	var out jobOutputResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("decode status response: %w", err)
 	}
-	return out.Status, nil
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return "", fmt.Errorf("status failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	if status := statusFromJobOutput(out.Output); status != "" {
+		return status, nil
+	}
+	return "pending", nil
 }
 
 func (c *Client) CancelJob(ctx context.Context, jobID string) error {
-	req, err := c.newRequest(ctx, http.MethodDelete, fmt.Sprintf("jobs/%s", url.PathEscape(jobID)), nil)
+	if _, taskID, ok := parseTaskJobRef(jobID); ok {
+		return c.cancelTask(ctx, taskID)
+	}
+
+	req, err := c.newRequest(ctx, http.MethodDelete, fmt.Sprintf("compute/jobs/perlmutter/%s", url.PathEscape(jobID)), nil)
 	if err != nil {
 		return err
 	}
@@ -190,6 +277,24 @@ func (c *Client) CancelJob(ctx context.Context, jobID string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("cancel failed: %s", responseError(resp))
+	}
+	return nil
+}
+
+func (c *Client) cancelTask(ctx context.Context, taskID string) error {
+	req, err := c.newRequest(ctx, http.MethodDelete, fmt.Sprintf("tasks/%s", url.PathEscape(taskID)), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("cancel task request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("cancel failed: %s", responseError(resp))
 	}
 	return nil
@@ -329,4 +434,58 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func makeTaskJobRef(machine, taskID string) string {
+	return taskJobRefPrefix + url.QueryEscape(machine) + ":" + url.QueryEscape(taskID)
+}
+
+func parseTaskJobRef(ref string) (string, string, bool) {
+	if !strings.HasPrefix(ref, taskJobRefPrefix) {
+		return "", "", false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(ref, taskJobRefPrefix), ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	machine, err := url.QueryUnescape(parts[0])
+	if err != nil {
+		return "", "", false
+	}
+	taskID, err := url.QueryUnescape(parts[1])
+	if err != nil {
+		return "", "", false
+	}
+	return machine, taskID, machine != "" && taskID != ""
+}
+
+func extractSlurmJobID(result string) string {
+	return slurmJobIDPattern.FindString(result)
+}
+
+func statusFromJobOutput(rows []map[string]string) string {
+	for _, row := range rows {
+		for _, key := range []string{"state", "State", "STATE", "job_state", "JobState", "ST"} {
+			if status := normalizeSlurmStatus(row[key]); status != "" {
+				return status
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeSlurmStatus(status string) string {
+	status = strings.ToUpper(strings.TrimSpace(status))
+	switch status {
+	case "PD", "PENDING", "CONFIGURING":
+		return "pending"
+	case "R", "RUNNING", "CG", "COMPLETING", "S", "SUSPENDED":
+		return "running"
+	case "CD", "COMPLETED", "COMPLETED+":
+		return "completed"
+	case "F", "FAILED", "CA", "CANCELLED", "CANCELED", "TO", "TIMEOUT", "NF", "NODE_FAIL", "OOM", "OUT_OF_MEMORY":
+		return "failed"
+	default:
+		return strings.ToLower(status)
+	}
 }

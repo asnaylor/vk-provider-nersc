@@ -30,6 +30,6 @@ spec:
 
 ## Behavior
 - Without staging annotations, VK mounts scratch-backed volumes and performs no Globus transfers.
-- With `nersc.sf/inputSource`, VK stages data to `/global/cscratch1/sd/<user>/<pod>/<volume>` before job submission.
+- With `nersc.sf/inputSource`, VK stages data to the workload scratch path under `$SCRATCH/vk-provider-nersc/<pod>/<volume>` before job submission.
 - With `nersc.sf/stageOut: "true"` and `nersc.sf/outputDest`, VK stages output after successful job completion.
 - PVC annotations are not read directly by the provider; copy staging annotations to the pod template.

@@ -28,7 +28,8 @@ metadata:
     nersc.slurm/launcher: "srun"
     nersc.slurm/mem: "128GB"
     nersc.slurm/time: "02:00:00"
-    nersc.slurm/partition: "gpu"
+    nersc.slurm/qos: "debug"
+    nersc.slurm/constraint: "gpu"
 spec:
   nodeSelector:
     kubernetes.io/hostname: perlmutter-vk

@@ -6,7 +6,7 @@ import (
 	"io"
 	"log"
 	"net/url"
-	"os"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -126,6 +126,16 @@ func NewNerscProvider(endpoint, nodeName string, tokenResolver TokenResolver) (*
 	}, nil
 }
 
+func VirtualNodeLabels(nodeName string) map[string]string {
+	return map[string]string{
+		"type":                   "virtual-kubelet",
+		"kubernetes.io/role":     "agent",
+		"kubernetes.io/hostname": nodeName,
+		"kubernetes.io/os":       "linux",
+		"kubernetes.io/arch":     "amd64",
+	}
+}
+
 func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if pod == nil {
 		return fmt.Errorf("pod is required")
@@ -149,23 +159,18 @@ func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return fmt.Errorf("create Superfacility client for pod %s: %w", key, err)
 	}
 
-	user := os.Getenv("USER")
-	if user == "" {
-		user = "default"
-	}
-
 	ssName, ordinal := detectStatefulSet(pod)
 
 	var jobScratchBase string
 	if ssName != "" {
-		jobScratchBase = fmt.Sprintf("/global/cscratch1/sd/%s/%s/%d", user, ssName, ordinal)
+		jobScratchBase = path.Join("$SCRATCH", "vk-provider-nersc", ssName, strconv.Itoa(ordinal))
 	} else {
-		jobScratchBase = fmt.Sprintf("/global/cscratch1/sd/%s/%s", user, pod.Name)
+		jobScratchBase = path.Join("$SCRATCH", "vk-provider-nersc", pod.Name)
 	}
 
 	volumeScratchPaths := make(map[string]string)
 	for _, vol := range pod.Spec.Volumes {
-		scratchPath := fmt.Sprintf("%s/%s", jobScratchBase, vol.Name)
+		scratchPath := path.Join(jobScratchBase, vol.Name)
 		volumeScratchPaths[vol.Name] = scratchPath
 	}
 
@@ -351,8 +356,10 @@ func (p *NerscProvider) GetPod(ctx context.Context, namespace, name string) (*co
 
 	status, err := client.GetJobStatus(ctx, state.jobID)
 	if err != nil {
+		log.Printf("Failed to get status for pod %s job %s: %v", key, state.jobID, err)
 		return nil, err
 	}
+	log.Printf("Pod %s job %s status %q", key, state.jobID, status)
 
 	podStatus := p.podStatusForJob(ctx, key, token, mapJobStatusToPodPhase(status))
 
@@ -523,7 +530,8 @@ func (p *NerscProvider) NotifyNodeStatus(ctx context.Context, cb func(*corev1.No
 func (p *NerscProvider) nodeStatus(ctx context.Context) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: p.nodeName,
+			Name:   p.nodeName,
+			Labels: VirtualNodeLabels(p.nodeName),
 		},
 		Status: corev1.NodeStatus{
 			Conditions:      p.NodeConditions(ctx),

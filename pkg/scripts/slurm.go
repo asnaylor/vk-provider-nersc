@@ -135,7 +135,6 @@ func slurmOptionsFromPod(pod *corev1.Pod) (slurmOptions, error) {
 		Launcher:    launcherNone,
 		Mem:         "4GB",
 		Time:        "00:30:00",
-		Partition:   "regular",
 	}
 
 	var err error
@@ -217,8 +216,10 @@ func renderSlurmDirectives(opts slurmOptions) string {
 	lines = append(lines,
 		fmt.Sprintf("#SBATCH --mem=%s", opts.Mem),
 		fmt.Sprintf("#SBATCH --time=%s", opts.Time),
-		fmt.Sprintf("#SBATCH --partition=%s", opts.Partition),
 	)
+	if opts.Partition != "" {
+		lines = append(lines, fmt.Sprintf("#SBATCH --partition=%s", opts.Partition))
+	}
 	if opts.QOS != "" {
 		lines = append(lines, fmt.Sprintf("#SBATCH --qos=%s", opts.QOS))
 	}
@@ -334,7 +335,7 @@ func buildVolumeArgs(mounts []corev1.VolumeMount, volPaths map[string]string) []
 			if m.ReadOnly {
 				mode = "ro"
 			}
-			args = append(args, "--volume", shellQuote(fmt.Sprintf("%s:%s:%s", hostPath, m.MountPath, mode)))
+			args = append(args, "--volume", shellQuoteWithScratchExpansion(fmt.Sprintf("%s:%s:%s", hostPath, m.MountPath, mode)))
 		}
 	}
 	return args
@@ -366,7 +367,7 @@ func buildVolumeSetupLines(mounts []corev1.VolumeMount, volPaths map[string]stri
 			continue
 		}
 		seen[hostPath] = struct{}{}
-		lines = append(lines, fmt.Sprintf("mkdir -p -- %s", shellQuote(hostPath)))
+		lines = append(lines, fmt.Sprintf("mkdir -p -- %s", shellQuoteWithScratchExpansion(hostPath)))
 	}
 	return lines
 }
@@ -381,4 +382,29 @@ func shellQuoteAll(values []string) []string {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+func shellQuoteWithScratchExpansion(value string) string {
+	switch {
+	case value == "$SCRATCH":
+		return `"$SCRATCH"`
+	case strings.HasPrefix(value, "$SCRATCH/"):
+		return `"$SCRATCH/` + shellDoubleQuoteLiteral(value[len("$SCRATCH/"):]) + `"`
+	case value == "${SCRATCH}":
+		return `"${SCRATCH}"`
+	case strings.HasPrefix(value, "${SCRATCH}/"):
+		return `"${SCRATCH}/` + shellDoubleQuoteLiteral(value[len("${SCRATCH}/"):]) + `"`
+	default:
+		return shellQuote(value)
+	}
+}
+
+func shellDoubleQuoteLiteral(value string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		`$`, `\$`,
+		"`", "\\`",
+	)
+	return replacer.Replace(value)
 }

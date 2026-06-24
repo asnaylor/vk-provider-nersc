@@ -140,7 +140,6 @@ By default, each pod is submitted as a conservative single-node Slurm job:
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4GB
 #SBATCH --time=00:30:00
-#SBATCH --partition=regular
 ```
 
 Set Slurm-specific resource needs on the pod annotations. Kubernetes CPU/memory requests are useful for Kubernetes scheduling metadata, but they do not express Slurm topology such as node count, tasks per node, GPU layout, or walltime.
@@ -160,7 +159,8 @@ metadata:
     nersc.slurm/launcher: "srun"
     nersc.slurm/mem: "128GB"
     nersc.slurm/time: "02:00:00"
-    nersc.slurm/partition: "regular"
+    nersc.slurm/qos: "debug"
+    nersc.slurm/constraint: "gpu"
 ```
 
 Supported Slurm annotations:
@@ -177,7 +177,7 @@ Supported Slurm annotations:
 | `nersc.slurm/launcher` | Rank launcher for the container command. Use `srun` for rank-launched pods; defaults to `none`. |
 | `nersc.slurm/mem` | `#SBATCH --mem`; defaults to `4GB`. |
 | `nersc.slurm/time` | `#SBATCH --time`; defaults to `00:30:00`. |
-| `nersc.slurm/partition` | `#SBATCH --partition`; defaults to `regular`. |
+| `nersc.slurm/partition` | `#SBATCH --partition`; omitted by default. Prefer `nersc.slurm/qos` and `nersc.slurm/constraint` on Perlmutter unless you know a partition is required. |
 | `nersc.slurm/qos` | `#SBATCH --qos`; omitted by default. |
 | `nersc.slurm/constraint` | `#SBATCH --constraint`; omitted by default. |
 | `nersc.slurm/account` | `#SBATCH --account`; omitted by default. The provider also sends this value as the Superfacility API job `project`. |
@@ -213,7 +213,8 @@ spec:
         nersc.slurm/launcher: "srun"
         nersc.slurm/mem: "128GB"
         nersc.slurm/time: "00:30:00"
-        nersc.slurm/partition: "gpu"
+        nersc.slurm/qos: "debug"
+        nersc.slurm/constraint: "gpu"
     spec:
       nodeSelector:
         kubernetes.io/hostname: perlmutter-vk

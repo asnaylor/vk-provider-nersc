@@ -67,6 +67,14 @@ func NewSecretTokenResolver(secrets coreclientv1.SecretsGetter) *SecretTokenReso
 	}
 }
 
+func HasSuperfacilityCredentials(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	return getAnnotation(pod, annotationCredentialSecretName) != "" ||
+		getAnnotation(pod, annotationTokenSecretName) != ""
+}
+
 func (r *SecretTokenResolver) TokenForPod(ctx context.Context, pod *corev1.Pod) (string, error) {
 	if r == nil || r.secrets == nil {
 		return "", fmt.Errorf("Kubernetes secret client is not configured")

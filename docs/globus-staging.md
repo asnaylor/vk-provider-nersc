@@ -14,7 +14,7 @@ metadata:
 ```
 VK will:
 1. Create a transfer request via Superfacility API
-2. Wait until data is staged into `/global/cscratch1/sd/<user>/<pod>/<volume>`
+2. Wait until data is staged into the workload scratch path under `$SCRATCH/vk-provider-nersc/<pod>/<volume>`
 3. Mount the directory in your container
 
 ## Stage-Out
