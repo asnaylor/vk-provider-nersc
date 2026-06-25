@@ -2,14 +2,18 @@
 
 ## Install VK Provider (Dev)
 ```bash
-helm install vk-nersc ./chart -f chart/values-dev.yaml \
-  --set sfApiToken=<your_token>
+helm install vk-nersc ./chart -f chart/values-dev.yaml
 ```
 
 ## Install VK Provider (Prod)
 ```bash
-helm install vk-nersc ./chart -f chart/values-production.yaml \
-  --set sfApiToken=<your_token>
+helm install vk-nersc ./chart -f chart/values-production.yaml
+```
+
+## Create a Workload Credential Secret
+```bash
+kubectl create secret generic sfapi-client \
+  --from-file=sf_api.json=./sf_api.json
 ```
 
 ## Enable StatefulSet via Helm Values
@@ -18,7 +22,9 @@ statefulset:
   enabled: true
   name: hpc-stateful
   replicas: 3
-  project: m1234
+  account: m1234
+  credentialSecretName: sfapi-client
+  credentialSecretKey: sf_api.json
   inputSource: "globus://endpoint-id/path/to/data"
   outputDest: "globus://endpoint-id/path/to/output"
   stageOut: "true"
@@ -39,7 +45,7 @@ statefulset:
 
 ## Upgrade
 ```bash
-helm upgrade vk-nersc ./chart -f chart/values-production.yaml --set sfApiToken=<your_token>
+helm upgrade vk-nersc ./chart -f chart/values-production.yaml
 ```
 
 ## Uninstall

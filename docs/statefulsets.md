@@ -7,7 +7,7 @@
 
 ## VK Enhancements
 - Detects StatefulSet pods via ownerReferences
-- Creates stable scratch paths: `/global/cscratch1/sd/<user>/<statefulset>/<ordinal>`
+- Creates stable scratch paths: `$SCRATCH/vk-provider-nersc/<statefulset>/<ordinal>`
 - Supports per-replica data staging
 
 ## Example
