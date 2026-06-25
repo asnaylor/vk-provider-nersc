@@ -24,12 +24,26 @@ spec:
           value: "{{ .Values.sfApiEndpoint }}"
         - name: VK_NODE_NAME
           value: "{{ .Values.vkNodeName }}"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: VK_KUBELET_LISTEN_ADDR
+          value: ":{{ .Values.kubeletPort }}"
+{{- with .Values.sfapiTransferLocalRoot }}
+        - name: SFAPI_TRANSFER_LOCAL_ROOT
+          value: "{{ . }}"
+{{- end }}
 {{- with .Values.extraEnv }}
 {{- range . }}
         - name: {{ .name }}
           value: "{{ .value }}"
 {{- end }}
 {{- end }}
+        ports:
+        - name: kubelet
+          containerPort: {{ .Values.kubeletPort }}
+          protocol: TCP
 {{- with .Values.resources }}
         resources:
 {{ toYaml . | indent 10 }}

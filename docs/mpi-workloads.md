@@ -18,7 +18,7 @@ metadata:
   name: gpu-rank-test
   annotations:
     nersc.slurm/account: "m1234"
-    nersc.sf/tokenSecretName: "sf-api-token"
+    nersc.sf/credentialSecretName: "sfapi-client"
     nersc.slurm/nodes: "2"
     nersc.slurm/ntasks: "8"
     nersc.slurm/tasks-per-node: "4"
@@ -28,7 +28,8 @@ metadata:
     nersc.slurm/launcher: "srun"
     nersc.slurm/mem: "128GB"
     nersc.slurm/time: "02:00:00"
-    nersc.slurm/partition: "gpu"
+    nersc.slurm/qos: "debug"
+    nersc.slurm/constraint: "gpu"
 spec:
   nodeSelector:
     kubernetes.io/hostname: perlmutter-vk

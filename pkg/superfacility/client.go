@@ -3,16 +3,24 @@ package superfacility
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const maxErrorBodyBytes = 4096
+
+const taskJobRefPrefix = "sfapi-task:"
+
+var slurmJobIDPattern = regexp.MustCompile(`\b[0-9]+(?:_[0-9]+)?\b`)
 
 type Client struct {
 	Endpoint string
@@ -36,7 +44,42 @@ type JobSubmissionRequest struct {
 }
 
 type JobSubmissionResponse struct {
-	JobID string `json:"jobid"`
+	JobID  string `json:"jobid"`
+	TaskID string `json:"task_id"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
+}
+
+type taskResponse struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Result string `json:"result"`
+}
+
+type commandResponse struct {
+	TaskID string `json:"task_id"`
+	Status string `json:"status"`
+	Error  string `json:"error"`
+}
+
+type jobOutputResponse struct {
+	Status string              `json:"status"`
+	Output []map[string]string `json:"output"`
+	Error  string              `json:"error"`
+}
+
+type fileDownloadResponse struct {
+	Status   string `json:"status"`
+	File     string `json:"file"`
+	Error    string `json:"error"`
+	IsBinary bool   `json:"is_binary"`
+}
+
+type fileUploadResponse struct {
+	Status string `json:"status"`
+	Error  string `json:"error"`
+	File   string `json:"file"`
+	Path   string `json:"path"`
 }
 
 type GlobusTransferRequest struct {
@@ -121,16 +164,19 @@ func (r GlobusTransferResult) IsComplete() (bool, bool) {
 }
 
 func (c *Client) SubmitJob(ctx context.Context, req JobSubmissionRequest) (string, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return "", fmt.Errorf("marshal job submission: %w", err)
+	if strings.TrimSpace(req.System) == "" {
+		return "", fmt.Errorf("job submission system is required")
 	}
 
-	httpReq, err := c.newRequest(ctx, http.MethodPost, "jobs", bytes.NewReader(body))
+	form := url.Values{}
+	form.Set("job", req.Script)
+	form.Set("isPath", "false")
+
+	httpReq, err := c.newRequest(ctx, http.MethodPost, fmt.Sprintf("compute/jobs/%s", url.PathEscape(req.System)), strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
@@ -146,39 +192,139 @@ func (c *Client) SubmitJob(ctx context.Context, req JobSubmissionRequest) (strin
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("decode submit response: %w", err)
 	}
-	if out.JobID == "" {
-		return "", fmt.Errorf("submit response missing jobid")
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return "", fmt.Errorf("submit failed: %s", firstNonEmpty(out.Error, out.Status))
 	}
-	return out.JobID, nil
+	if out.JobID != "" {
+		return out.JobID, nil
+	}
+	if out.TaskID == "" {
+		return "", fmt.Errorf("submit response missing task_id")
+	}
+	return makeTaskJobRef(req.System, out.TaskID), nil
 }
 
 func (c *Client) GetJobStatus(ctx context.Context, jobID string) (string, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("jobs/%s", url.PathEscape(jobID)), nil)
+	if machine, taskID, ok := parseTaskJobRef(jobID); ok {
+		return c.getTaskBackedJobStatus(ctx, machine, taskID)
+	}
+	return c.getComputeJobStatus(ctx, "perlmutter", jobID)
+}
+
+func (c *Client) getTaskBackedJobStatus(ctx context.Context, machine, taskID string) (string, error) {
+	task, err := c.getTask(ctx, taskID)
 	if err != nil {
 		return "", err
+	}
+	switch strings.ToLower(strings.TrimSpace(task.Status)) {
+	case "new", "":
+		return "pending", nil
+	case "failed", "cancelled", "canceled":
+		return "failed", nil
+	case "completed":
+		slurmJobID := extractSlurmJobID(task.Result)
+		if slurmJobID == "" {
+			return "", fmt.Errorf("task %s completed but result did not contain a Slurm job id: %q", taskID, task.Result)
+		}
+		return c.getComputeJobStatus(ctx, machine, slurmJobID)
+	default:
+		return strings.ToLower(task.Status), nil
+	}
+}
+
+func (c *Client) getTask(ctx context.Context, taskID string) (taskResponse, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("tasks/%s", url.PathEscape(taskID)), nil)
+	if err != nil {
+		return taskResponse{}, err
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("get job status request: %w", err)
+		return taskResponse{}, fmt.Errorf("get task request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status failed: %s", responseError(resp))
+		return taskResponse{}, fmt.Errorf("task status failed: %s", responseError(resp))
 	}
 
-	var out struct {
-		Status string `json:"status"`
-	}
+	var out taskResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("decode status response: %w", err)
+		return taskResponse{}, fmt.Errorf("decode task response: %w", err)
 	}
-	return out.Status, nil
+	return out, nil
+}
+
+func (c *Client) waitForTask(ctx context.Context, taskID string) (taskResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	poll := time.NewTicker(2 * time.Second)
+	defer poll.Stop()
+
+	for {
+		task, err := c.getTask(ctx, taskID)
+		if err != nil {
+			return taskResponse{}, err
+		}
+		switch strings.ToLower(strings.TrimSpace(task.Status)) {
+		case "completed":
+			return task, nil
+		case "failed", "cancelled", "canceled":
+			return taskResponse{}, fmt.Errorf("task %s failed: %s", taskID, task.Result)
+		}
+
+		select {
+		case <-ctx.Done():
+			return taskResponse{}, ctx.Err()
+		case <-poll.C:
+		}
+	}
+}
+
+func (c *Client) getComputeJobStatus(ctx context.Context, machine, jobID string) (string, error) {
+	out, err := c.getComputeJobOutput(ctx, machine, jobID)
+	if err != nil {
+		return "", err
+	}
+	if status := statusFromJobOutput(out.Output); status != "" {
+		return status, nil
+	}
+	return "pending", nil
+}
+
+func (c *Client) getComputeJobOutput(ctx context.Context, machine, jobID string) (jobOutputResponse, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("compute/jobs/%s/%s?sacct=true&cached=false", url.PathEscape(machine), url.PathEscape(jobID)), nil)
+	if err != nil {
+		return jobOutputResponse{}, err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return jobOutputResponse{}, fmt.Errorf("get job status request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return jobOutputResponse{}, fmt.Errorf("status failed: %s", responseError(resp))
+	}
+
+	var out jobOutputResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return jobOutputResponse{}, fmt.Errorf("decode status response: %w", err)
+	}
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return jobOutputResponse{}, fmt.Errorf("status failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	return out, nil
 }
 
 func (c *Client) CancelJob(ctx context.Context, jobID string) error {
-	req, err := c.newRequest(ctx, http.MethodDelete, fmt.Sprintf("jobs/%s", url.PathEscape(jobID)), nil)
+	if _, taskID, ok := parseTaskJobRef(jobID); ok {
+		return c.cancelTask(ctx, taskID)
+	}
+
+	req, err := c.newRequest(ctx, http.MethodDelete, fmt.Sprintf("compute/jobs/perlmutter/%s", url.PathEscape(jobID)), nil)
 	if err != nil {
 		return err
 	}
@@ -195,26 +341,212 @@ func (c *Client) CancelJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
-func (c *Client) FetchJobLogs(ctx context.Context, jobID string) (string, error) {
-	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("jobs/%s/logs", url.PathEscape(jobID)), nil)
+func (c *Client) cancelTask(ctx context.Context, taskID string) error {
+	req, err := c.newRequest(ctx, http.MethodDelete, fmt.Sprintf("tasks/%s", url.PathEscape(taskID)), nil)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetch job logs request: %w", err)
+		return fmt.Errorf("cancel task request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("cancel failed: %s", responseError(resp))
+	}
+	return nil
+}
+
+func (c *Client) FetchJobLogs(ctx context.Context, jobID string) (string, error) {
+	machine := "perlmutter"
+	slurmJobID := jobID
+	if taskMachine, taskID, ok := parseTaskJobRef(jobID); ok {
+		machine = taskMachine
+		task, err := c.getTask(ctx, taskID)
+		if err != nil {
+			return "", err
+		}
+		switch strings.ToLower(strings.TrimSpace(task.Status)) {
+		case "completed":
+			slurmJobID = extractSlurmJobID(task.Result)
+			if slurmJobID == "" {
+				return task.Result, nil
+			}
+		case "failed", "cancelled", "canceled":
+			return task.Result, nil
+		default:
+			return "", nil
+		}
+	}
+
+	out, err := c.getComputeJobOutput(ctx, machine, slurmJobID)
+	if err != nil {
+		return "", err
+	}
+	stdoutPath := stdoutPathFromJobOutput(out.Output)
+	if stdoutPath == "" {
+		return "", fmt.Errorf("job %s did not include a stdout path", slurmJobID)
+	}
+	return c.downloadTextFile(ctx, machine, stdoutPath)
+}
+
+func (c *Client) UploadFile(ctx context.Context, machine, remotePath, filename string, contents io.Reader) error {
+	machine = strings.TrimSpace(machine)
+	remotePath = strings.TrimSpace(remotePath)
+	filename = strings.TrimSpace(filename)
+	if machine == "" {
+		return fmt.Errorf("machine is required")
+	}
+	if remotePath == "" {
+		return fmt.Errorf("remote path is required")
+	}
+	if filename == "" {
+		filename = path.Base(remotePath)
+	}
+	if contents == nil {
+		return fmt.Errorf("file contents are required")
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return fmt.Errorf("create upload file part: %w", err)
+	}
+	if _, err := io.Copy(part, contents); err != nil {
+		return fmt.Errorf("copy upload file contents: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("close upload multipart body: %w", err)
+	}
+
+	req, err := c.newRequest(ctx, http.MethodPut, fmt.Sprintf("utilities/upload/%s/%s", url.PathEscape(machine), escapeRemotePath(remotePath)), &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload file request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("upload file failed: %s", responseError(resp))
+	}
+
+	var out fileUploadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("decode file upload response: %w", err)
+	}
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return fmt.Errorf("upload file failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	return nil
+}
+
+func (c *Client) RunCommand(ctx context.Context, machine, executable string) (string, error) {
+	machine = strings.TrimSpace(machine)
+	executable = strings.TrimSpace(executable)
+	if machine == "" {
+		return "", fmt.Errorf("machine is required")
+	}
+	if executable == "" {
+		return "", fmt.Errorf("executable is required")
+	}
+
+	form := url.Values{}
+	form.Set("executable", executable)
+
+	req, err := c.newRequest(ctx, http.MethodPost, fmt.Sprintf("utilities/command/%s", url.PathEscape(machine)), strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("run command request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("logs failed: %s", responseError(resp))
+		return "", fmt.Errorf("run command failed: %s", responseError(resp))
 	}
-	data, err := io.ReadAll(resp.Body)
+
+	var out commandResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode command response: %w", err)
+	}
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return "", fmt.Errorf("run command failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	if out.TaskID == "" {
+		return "", fmt.Errorf("run command response missing task_id")
+	}
+
+	task, err := c.waitForTask(ctx, out.TaskID)
 	if err != nil {
-		return "", fmt.Errorf("read logs response: %w", err)
+		return "", err
+	}
+	return task.Result, nil
+}
+
+func (c *Client) DownloadFile(ctx context.Context, machine, remotePath string) ([]byte, error) {
+	return c.downloadFile(ctx, machine, remotePath, true)
+}
+
+func (c *Client) downloadTextFile(ctx context.Context, machine, remotePath string) (string, error) {
+	data, err := c.downloadFile(ctx, machine, remotePath, false)
+	if err != nil {
+		return "", err
 	}
 	return string(data), nil
+}
+
+func (c *Client) downloadFile(ctx context.Context, machine, remotePath string, binary bool) ([]byte, error) {
+	machine = strings.TrimSpace(machine)
+	remotePath = strings.TrimSpace(remotePath)
+	if machine == "" {
+		return nil, fmt.Errorf("machine is required")
+	}
+	if remotePath == "" {
+		return nil, fmt.Errorf("remote path is required")
+	}
+
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("utilities/download/%s/%s?binary=%t", url.PathEscape(machine), escapeRemotePath(remotePath), binary), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("download file request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download file failed: %s", responseError(resp))
+	}
+
+	var out fileDownloadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode file download response: %w", err)
+	}
+	if strings.EqualFold(out.Status, "ERROR") || out.Error != "" {
+		return nil, fmt.Errorf("download file failed: %s", firstNonEmpty(out.Error, out.Status))
+	}
+	if !out.IsBinary {
+		return []byte(out.File), nil
+	}
+	data, err := base64.StdEncoding.DecodeString(out.File)
+	if err != nil {
+		return nil, fmt.Errorf("decode binary file download: %w", err)
+	}
+	return data, nil
 }
 
 func (c *Client) StartGlobusTransfer(ctx context.Context, req GlobusTransferRequest) (GlobusTransfer, error) {
@@ -329,4 +661,101 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func makeTaskJobRef(machine, taskID string) string {
+	return taskJobRefPrefix + url.QueryEscape(machine) + ":" + url.QueryEscape(taskID)
+}
+
+func parseTaskJobRef(ref string) (string, string, bool) {
+	if !strings.HasPrefix(ref, taskJobRefPrefix) {
+		return "", "", false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(ref, taskJobRefPrefix), ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	machine, err := url.QueryUnescape(parts[0])
+	if err != nil {
+		return "", "", false
+	}
+	taskID, err := url.QueryUnescape(parts[1])
+	if err != nil {
+		return "", "", false
+	}
+	return machine, taskID, machine != "" && taskID != ""
+}
+
+func extractSlurmJobID(result string) string {
+	return slurmJobIDPattern.FindString(result)
+}
+
+func statusFromJobOutput(rows []map[string]string) string {
+	for _, row := range rows {
+		for _, key := range []string{"state", "State", "STATE", "job_state", "JobState", "ST"} {
+			if status := normalizeSlurmStatus(row[key]); status != "" {
+				return status
+			}
+		}
+	}
+	return ""
+}
+
+func stdoutPathFromJobOutput(rows []map[string]string) string {
+	for _, row := range rows {
+		for _, key := range []string{"stdout", "StdOut", "stdoutpath", "stdoutPath", "StdoutPath"} {
+			if value := strings.TrimSpace(row[key]); value != "" {
+				return value
+			}
+		}
+		if adminComment := strings.TrimSpace(firstNonEmpty(row["admincomment"], row["AdminComment"])); adminComment != "" {
+			var comment struct {
+				StdoutPath string `json:"stdoutPath"`
+			}
+			if err := json.Unmarshal([]byte(adminComment), &comment); err == nil && strings.TrimSpace(comment.StdoutPath) != "" {
+				return strings.TrimSpace(comment.StdoutPath)
+			}
+		}
+		workdir := strings.TrimSpace(firstNonEmpty(row["workdir"], row["WorkDir"]))
+		jobName := strings.TrimSpace(firstNonEmpty(row["jobname"], row["JobName"]))
+		if workdir != "" && jobName != "" {
+			return path.Join(workdir, jobName+".out")
+		}
+	}
+	return ""
+}
+
+func escapeRemotePath(remotePath string) string {
+	remotePath = strings.TrimSpace(remotePath)
+	if remotePath == "" {
+		return ""
+	}
+
+	prefix := ""
+	if strings.HasPrefix(remotePath, "/") {
+		prefix = "/"
+		remotePath = strings.TrimLeft(remotePath, "/")
+	}
+
+	parts := strings.Split(remotePath, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return prefix + strings.Join(parts, "/")
+}
+
+func normalizeSlurmStatus(status string) string {
+	status = strings.ToUpper(strings.TrimSpace(status))
+	switch status {
+	case "PD", "PENDING", "CONFIGURING":
+		return "pending"
+	case "R", "RUNNING", "CG", "COMPLETING", "S", "SUSPENDED":
+		return "running"
+	case "CD", "COMPLETED", "COMPLETED+":
+		return "completed"
+	case "F", "FAILED", "CA", "CANCELLED", "CANCELED", "TO", "TIMEOUT", "NF", "NODE_FAIL", "OOM", "OUT_OF_MEMORY":
+		return "failed"
+	default:
+		return strings.ToLower(status)
+	}
 }

@@ -58,7 +58,7 @@ export VK_NODE_NAME=perlmutter-vk
 ./bin/vk-nersc
 ```
 
-Workloads provide their own Superfacility API token through a Kubernetes Secret referenced by pod annotations.
+Workloads provide their own Superfacility API client credentials through a Kubernetes Secret referenced by pod annotations. The provider exchanges those credentials for short-lived access tokens as needed.
 
 ---
 
@@ -95,21 +95,39 @@ helmfile apply
 
 ## Workload Authentication
 
-The provider does not use a global Superfacility API token. Each workload must reference a Kubernetes Secret in the workload namespace:
+The provider does not use global Superfacility API credentials. Each workload must reference a Kubernetes Secret in the workload namespace. The preferred Secret shape matches the official SFAPI Python client key file:
 
 ```bash
-kubectl create secret generic sf-api-token \
-  --from-literal=token=<your_superfacility_api_token>
+kubectl create secret generic sfapi-client \
+  --from-file=sf_api.json=./sf_api.json
+```
+
+`sf_api.json` contains the SFAPI `client_id` and RSA JWK private key:
+
+```json
+{
+  "client_id": "<your_sfapi_client_id>",
+  "secret": {
+    "kty": "RSA",
+    "n": "...",
+    "e": "...",
+    "d": "...",
+    "p": "...",
+    "q": "...",
+    "dp": "...",
+    "dq": "...",
+    "qi": "..."
+  }
+}
 ```
 
 ```yaml
 metadata:
   annotations:
-    nersc.sf/tokenSecretName: "sf-api-token"
-    nersc.sf/tokenSecretKey: "token"
+    nersc.sf/credentialSecretName: "sfapi-client"
 ```
 
-`nersc.sf/tokenSecretKey` defaults to `token`. The same token is used for job submit, status, logs, cancel, and optional Globus stage-in/out for that pod.
+`nersc.sf/credentialSecretKey` defaults to `sf_api.json`. The provider also supports Secrets with separate `client_id` and `jwk` keys. Access tokens are minted and refreshed in memory and are never written into generated Slurm scripts.
 
 ---
 
@@ -122,7 +140,6 @@ By default, each pod is submitted as a conservative single-node Slurm job:
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4GB
 #SBATCH --time=00:30:00
-#SBATCH --partition=regular
 ```
 
 Set Slurm-specific resource needs on the pod annotations. Kubernetes CPU/memory requests are useful for Kubernetes scheduling metadata, but they do not express Slurm topology such as node count, tasks per node, GPU layout, or walltime.
@@ -142,7 +159,8 @@ metadata:
     nersc.slurm/launcher: "srun"
     nersc.slurm/mem: "128GB"
     nersc.slurm/time: "02:00:00"
-    nersc.slurm/partition: "regular"
+    nersc.slurm/qos: "debug"
+    nersc.slurm/constraint: "gpu"
 ```
 
 Supported Slurm annotations:
@@ -159,7 +177,7 @@ Supported Slurm annotations:
 | `nersc.slurm/launcher` | Rank launcher for the container command. Use `srun` for rank-launched pods; defaults to `none`. |
 | `nersc.slurm/mem` | `#SBATCH --mem`; defaults to `4GB`. |
 | `nersc.slurm/time` | `#SBATCH --time`; defaults to `00:30:00`. |
-| `nersc.slurm/partition` | `#SBATCH --partition`; defaults to `regular`. |
+| `nersc.slurm/partition` | `#SBATCH --partition`; omitted by default. Prefer `nersc.slurm/qos` and `nersc.slurm/constraint` on Perlmutter unless you know a partition is required. |
 | `nersc.slurm/qos` | `#SBATCH --qos`; omitted by default. |
 | `nersc.slurm/constraint` | `#SBATCH --constraint`; omitted by default. |
 | `nersc.slurm/account` | `#SBATCH --account`; omitted by default. The provider also sends this value as the Superfacility API job `project`. |
@@ -168,11 +186,11 @@ Invalid annotation values fail pod submission before the Slurm job is created.
 
 ### Example: 2 GPU Nodes, 8 GPU Ranks
 
-Create the per-workload token Secret, then submit a Kubernetes `Job` that targets the virtual Perlmutter node. Replace the Slurm account, token, and image with values for your account and workload.
+Create the per-workload credential Secret, then submit a Kubernetes `Job` that targets the virtual Perlmutter node. Replace the Slurm account, client credentials, and image with values for your account and workload.
 
 ```bash
-kubectl create secret generic sf-api-token \
-  --from-literal=token=<your_superfacility_api_token>
+kubectl create secret generic sfapi-client \
+  --from-file=sf_api.json=./sf_api.json
 ```
 
 ```yaml
@@ -185,7 +203,7 @@ spec:
     metadata:
       annotations:
         nersc.slurm/account: "m1234"
-        nersc.sf/tokenSecretName: "sf-api-token"
+        nersc.sf/credentialSecretName: "sfapi-client"
         nersc.slurm/nodes: "2"
         nersc.slurm/ntasks: "8"
         nersc.slurm/tasks-per-node: "4"
@@ -195,7 +213,8 @@ spec:
         nersc.slurm/launcher: "srun"
         nersc.slurm/mem: "128GB"
         nersc.slurm/time: "00:30:00"
-        nersc.slurm/partition: "gpu"
+        nersc.slurm/qos: "debug"
+        nersc.slurm/constraint: "gpu"
     spec:
       nodeSelector:
         kubernetes.io/hostname: perlmutter-vk
@@ -238,7 +257,7 @@ Scheduler binds Pod to virtual node: perlmutter-vk
      v
 Virtual Kubelet calls NERSC provider CreatePod
      |
-     +--> read workload Secret: nersc.sf/tokenSecretName
+     +--> read workload Secret: nersc.sf/credentialSecretName
      |
      +--> build Slurm batch script from Pod spec and annotations
      |
@@ -286,7 +305,7 @@ Runtime layout
 1. The Kubernetes API server stores the `Job`; the Kubernetes Job controller creates a Pod from the job template.
 2. The Kubernetes scheduler sees `nodeSelector.kubernetes.io/hostname: perlmutter-vk` and binds the Pod to the virtual node served by this provider.
 3. Virtual Kubelet calls the NERSC provider's `CreatePod` for that Pod.
-4. The provider reads `nersc.sf/tokenSecretName` from the Pod annotations and loads that Secret from the workload namespace. This token is used only for this workload's Superfacility API calls.
+4. The provider reads `nersc.sf/credentialSecretName` from the Pod annotations and loads that Secret from the workload namespace. It exchanges the SFAPI client credentials for a short-lived access token used only for this workload's Superfacility API calls.
 5. The provider translates the Pod into a Slurm batch script. The annotations above render allocation directives for two GPU nodes and a rank launcher equivalent to:
 
 ```bash
@@ -313,7 +332,7 @@ metadata:
   name: compute-with-sidecar
   annotations:
     nersc.slurm/account: "m1234"
-    nersc.sf/tokenSecretName: "sf-api-token"
+    nersc.sf/credentialSecretName: "sfapi-client"
     nersc.vk/mainContainer: "worker"
     nersc.slurm/nodes: "1"
     nersc.slurm/time: "00:30:00"
@@ -355,7 +374,7 @@ spec:
         app: hpc-stateful
       annotations:
         nersc.slurm/account: "m1234"
-        nersc.sf/tokenSecretName: "sf-api-token"
+        nersc.sf/credentialSecretName: "sfapi-client"
         nersc.sf/inputSource: "globus://endpoint-id/path/to/data"
         nersc.sf/outputDest: "globus://endpoint-id/path/to/output"
         nersc.sf/stageOut: "true"
@@ -380,14 +399,15 @@ spec:
 
 ## PVC Integration & Optional Data Staging
 
-By default, workloads run directly against their Perlmutter scratch paths and no Globus transfer is started. This is the right mode when inputs already exist on scratch and outputs should remain there.
+By default, workloads run directly against their Perlmutter scratch paths and no data transfer is started. This is the right mode when inputs already exist on scratch and outputs should remain there.
 
-Add pod annotations to opt into Globus stage-in/out:
+Add pod annotations to opt into stage-in/out. `nersc.sf/transferMode` defaults to `globus`, which is the best fit for directory-scale endpoint-to-endpoint transfers:
 
 ```yaml
 metadata:
   annotations:
-    nersc.sf/tokenSecretName: "sf-api-token"
+    nersc.sf/credentialSecretName: "sfapi-client"
+    nersc.sf/transferMode: "globus"
     nersc.sf/inputSource: "globus://endpoint-id/path/to/input"
     nersc.sf/outputDest: "globus://endpoint-id/path/to/output"
     nersc.sf/stageOut: "true"
@@ -401,21 +421,38 @@ VK will:
 
 Globus URIs use the form `globus://<endpoint>/<absolute/path>`. The endpoint can be a Globus UUID or a NERSC shortcut supported by the Superfacility API, such as `dtn`, `hpss`, or `perlmutter`.
 
-The workload's Superfacility API token must come from a client with the optional Globus capability enabled. If staging annotations are present but Globus is not enabled for that token, stage-in fails before compute submission or stage-out marks the pod failed with the transfer error.
+The workload's Superfacility API client credentials must have the optional Globus capability enabled. If staging annotations are present but Globus is not enabled for that SFAPI client, stage-in fails before compute submission or stage-out marks the pod failed with the transfer error.
+
+Set `nersc.sf/transferMode: "sfapi"` to use the Superfacility API file utilities instead of Globus. This mode supports single-file upload/download between a provider-local directory and Perlmutter, so the provider deployment must set `SFAPI_TRANSFER_LOCAL_ROOT` through the Helm `sfapiTransferLocalRoot` value and mount any shared Airflow/provider volume at that path. Because SFAPI utility paths are concrete remote filesystem paths, `nersc.sf/scratchBase` must also be set to an absolute NERSC path such as `/pscratch/sd/a/alice/vk-provider-nersc`; `$SCRATCH` shell expansion is not available to the upload/download API.
+
+```yaml
+metadata:
+  annotations:
+    nersc.sf/credentialSecretName: "sfapi-client"
+    nersc.sf/transferMode: "sfapi"
+    nersc.sf/scratchBase: "/pscratch/sd/a/alice/vk-provider-nersc"
+    nersc.sf/inputSource: "inputs/config.json"
+    nersc.sf/outputDest: "outputs/result.json"
+    nersc.sf/stageOut: "true"
+```
+
+In SFAPI mode, `inputSource` and `outputDest` are paths under `SFAPI_TRANSFER_LOCAL_ROOT`. Stage-in creates the selected remote scratch directory, uploads the input file using the same basename, and stage-out downloads the matching file from the selected scratch volume back under `SFAPI_TRANSFER_LOCAL_ROOT`.
 
 ### Staging annotations
 
 | Annotation | Required | Description |
 | --- | --- | --- |
-| `nersc.sf/tokenSecretName` | Yes | Kubernetes Secret in the workload namespace containing the Superfacility API token for this pod. |
-| `nersc.sf/tokenSecretKey` | No | Secret data key for the token; defaults to `token`. |
-| `nersc.sf/inputSource` | No | Globus source URI to stage into Perlmutter scratch before submitting the Slurm job. |
-| `nersc.sf/outputDest` | Required when `stageOut` is `true` | Globus destination URI for output staging after successful job completion. |
+| `nersc.sf/credentialSecretName` | Yes | Kubernetes Secret in the workload namespace containing SFAPI client credentials for this pod. |
+| `nersc.sf/credentialSecretKey` | No | Secret data key containing `{"client_id": "...", "secret": {...}}`; defaults to `sf_api.json`. |
+| `nersc.sf/transferMode` | No | `globus` (default) or `sfapi`. |
+| `nersc.sf/scratchBase` | Required for `transferMode=sfapi` | Concrete absolute NERSC base path for per-pod scratch staging. Defaults to `$SCRATCH/vk-provider-nersc` for non-SFAPI modes. |
+| `nersc.sf/inputSource` | No | In Globus mode, a `globus://` source URI. In SFAPI mode, a provider-local file path under `SFAPI_TRANSFER_LOCAL_ROOT`. |
+| `nersc.sf/outputDest` | Required when `stageOut` is `true` | In Globus mode, a `globus://` destination URI. In SFAPI mode, a provider-local destination file path under `SFAPI_TRANSFER_LOCAL_ROOT`. |
 | `nersc.sf/stageOut` | No | Set to `true` to enable output staging. |
 | `nersc.sf/inputVolume` | Required for input staging with multiple volumes | Volume name whose scratch path should receive staged input. |
 | `nersc.sf/outputVolume` | Required for output staging with multiple volumes | Volume name whose scratch path should supply staged output. |
 | `nersc.sf/stageVolume` | No | Shared fallback volume name for both input and output staging. If omitted with one volume, that volume is used. If omitted with no volumes, the pod scratch base is used. |
-| `nersc.sf/globusUsername` | No | Optional Superfacility API `username` value for Globus transfers when the token has permission to act for another user. |
+| `nersc.sf/globusUsername` | No | Optional Superfacility API `username` value for Globus transfers when the SFAPI client has permission to act for another user. |
 
 Current staging annotations are read from the pod template. PVCs are still supported as Kubernetes volumes, but PVC annotations are not read directly by this provider unless they are copied onto the pod.
 
@@ -425,7 +462,7 @@ Current staging annotations are read from the pod template. PVCs are still suppo
 
 See the [`examples/`](examples/) directory for:
 
-- `sf-api-token-secret.yaml` — per-workload Superfacility token Secret
+- `sfapi-client-secret.yaml` — per-workload Superfacility client credential Secret
 - `pod-simple.yaml` — basic pod
 - `pod-multi.yaml` — multi-container pod
 - `pod-pvc.yaml` — PVC with data staging

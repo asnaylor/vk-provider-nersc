@@ -41,8 +41,10 @@ statefulset:
   name: hpc-stateful-dev
   replicas: 1
   account: m9999
-  tokenSecretName: sf-api-token
-  tokenSecretKey: token
+  credentialSecretName: sfapi-client
+  credentialSecretKey: sf_api.json
+  transferMode: globus
+  scratchBase: ""
   inputSource: ""
   inputVolume: data
   outputDest: ""

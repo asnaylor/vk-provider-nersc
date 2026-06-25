@@ -37,7 +37,6 @@ func TestSingleContainerScriptQuotesArgumentsAndCreatesVolumeDirs(t *testing.T) 
 		"#SBATCH --cpus-per-task=1",
 		"#SBATCH --mem=4GB",
 		"#SBATCH --time=00:30:00",
-		"#SBATCH --partition=regular",
 		"set -euo pipefail",
 		"mkdir -p -- '/scratch/demo/data path'",
 		"--volume '/scratch/demo/data path:/mnt/data:ro'",
@@ -54,6 +53,9 @@ func TestSingleContainerScriptQuotesArgumentsAndCreatesVolumeDirs(t *testing.T) 
 	}
 	if strings.Contains(script, "module load podman-hpc") {
 		t.Fatalf("script should not load a podman-hpc module:\n%s", script)
+	}
+	if strings.Contains(script, "#SBATCH --partition") {
+		t.Fatalf("partition should be omitted unless explicitly annotated:\n%s", script)
 	}
 }
 
@@ -118,6 +120,41 @@ func TestMultiContainerScriptRunsMainContainerAndCleansUpSidecars(t *testing.T) 
 	}
 	if strings.Contains(script, "module load podman-hpc") {
 		t.Fatalf("script should not load a podman-hpc module:\n%s", script)
+	}
+}
+
+func TestScratchVolumePathsExpandEnvironment(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:         "main",
+					Image:        "image",
+					VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/mnt/data"}},
+				},
+			},
+		},
+	}
+
+	script, err := PodToSlurmPodmanWithVolumes(pod, map[string]string{
+		"data": "$SCRATCH/vk-provider-nersc/demo/data",
+	})
+	if err != nil {
+		t.Fatalf("PodToSlurmPodmanWithVolumes returned error: %v", err)
+	}
+
+	wantFragments := []string{
+		`mkdir -p -- "$SCRATCH/vk-provider-nersc/demo/data"`,
+		`--volume "$SCRATCH/vk-provider-nersc/demo/data:/mnt/data:rw"`,
+	}
+	for _, fragment := range wantFragments {
+		if !strings.Contains(script, fragment) {
+			t.Fatalf("script missing %q:\n%s", fragment, script)
+		}
+	}
+	if strings.Contains(script, `'$SCRATCH`) {
+		t.Fatalf("scratch path should expand at runtime, not be single-quoted:\n%s", script)
 	}
 }
 

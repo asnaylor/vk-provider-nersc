@@ -2,7 +2,7 @@ package superfacility
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,22 +15,26 @@ func TestSubmitJobSendsRequestAndDecodesJobID(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/api/v1.2/jobs" {
-			t.Fatalf("path = %s, want /api/v1.2/jobs", r.URL.Path)
+		if r.URL.Path != "/api/v1.2/compute/jobs/perlmutter" {
+			t.Fatalf("path = %s, want compute job submit path", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer token" {
 			t.Fatalf("authorization header = %q", got)
 		}
-
-		var req JobSubmissionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
+		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+			t.Fatalf("content type = %q", got)
 		}
-		if req.Script != "#!/bin/bash" || req.System != "perlmutter" || req.Project != "m1234" {
-			t.Fatalf("unexpected request body: %+v", req)
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		if got := r.PostForm.Get("job"); got != "#!/bin/bash" {
+			t.Fatalf("job form = %q", got)
+		}
+		if got := r.PostForm.Get("isPath"); got != "false" {
+			t.Fatalf("isPath form = %q", got)
 		}
 
-		return response(http.StatusCreated, `{"jobid":"12345"}`), nil
+		return response(http.StatusOK, `{"task_id":"task-123","status":"OK"}`), nil
 	})
 
 	jobID, err := client.SubmitJob(context.Background(), JobSubmissionRequest{
@@ -41,25 +45,206 @@ func TestSubmitJobSendsRequestAndDecodesJobID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubmitJob returned error: %v", err)
 	}
-	if jobID != "12345" {
-		t.Fatalf("jobID = %q, want 12345", jobID)
+	if jobID != makeTaskJobRef("perlmutter", "task-123") {
+		t.Fatalf("jobID = %q, want task-backed ref", jobID)
 	}
 }
 
-func TestGetJobStatusEscapesJobID(t *testing.T) {
+func TestGetJobStatusPollsTaskAndSlurmJob(t *testing.T) {
+	requests := 0
 	client := newTestClient(func(r *http.Request) (*http.Response, error) {
-		if r.URL.EscapedPath() != "/api/v1.2/jobs/job%2F123" {
-			t.Fatalf("escaped path = %s, want /api/v1.2/jobs/job%%2F123", r.URL.EscapedPath())
+		requests++
+		switch requests {
+		case 1:
+			if r.URL.EscapedPath() != "/api/v1.2/tasks/task%2F123" {
+				t.Fatalf("escaped task path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"id":"task/123","status":"completed","result":"Submitted batch job 98765"}`), nil
+		case 2:
+			if r.URL.EscapedPath() != "/api/v1.2/compute/jobs/perlmutter/98765" {
+				t.Fatalf("escaped job path = %s", r.URL.EscapedPath())
+			}
+			if r.URL.Query().Get("sacct") != "true" || r.URL.Query().Get("cached") != "false" {
+				t.Fatalf("query = %s, want sacct=true cached=false", r.URL.RawQuery)
+			}
+			return response(http.StatusOK, `{"status":"OK","output":[{"State":"RUNNING"}]}`), nil
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, r.URL.String())
 		}
-		return response(http.StatusOK, `{"status":"running"}`), nil
+		return nil, nil
 	})
 
-	status, err := client.GetJobStatus(context.Background(), "job/123")
+	status, err := client.GetJobStatus(context.Background(), makeTaskJobRef("perlmutter", "task/123"))
 	if err != nil {
 		t.Fatalf("GetJobStatus returned error: %v", err)
 	}
 	if status != "running" {
 		t.Fatalf("status = %q, want running", status)
+	}
+}
+
+func TestFetchJobLogsDownloadsTaskBackedSlurmStdout(t *testing.T) {
+	requests := 0
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			if r.URL.EscapedPath() != "/api/v1.2/tasks/task%2F123" {
+				t.Fatalf("escaped task path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"id":"task/123","status":"completed","result":"{\"status\":\"ok\",\"jobid\":\"98765\",\"error\":null}"}`), nil
+		case 2:
+			if r.URL.EscapedPath() != "/api/v1.2/compute/jobs/perlmutter/98765" {
+				t.Fatalf("escaped job path = %s", r.URL.EscapedPath())
+			}
+			body := `{"status":"OK","output":[{"state":"COMPLETED","admincomment":"{\"stdoutPath\":\"/global/u2/a/asnaylor/perlmutter-smoke.out\"}"}]}`
+			return response(http.StatusOK, body), nil
+		case 3:
+			if r.URL.EscapedPath() != "/api/v1.2/utilities/download/perlmutter//global/u2/a/asnaylor/perlmutter-smoke.out" {
+				t.Fatalf("escaped download path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"status":"OK","file":"hello from perlmutter\n","error":null,"is_binary":false}`), nil
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, r.URL.String())
+		}
+		return nil, nil
+	})
+
+	logs, err := client.FetchJobLogs(context.Background(), makeTaskJobRef("perlmutter", "task/123"))
+	if err != nil {
+		t.Fatalf("FetchJobLogs returned error: %v", err)
+	}
+	if logs != "hello from perlmutter\n" {
+		t.Fatalf("logs = %q", logs)
+	}
+}
+
+func TestFetchJobLogsFallsBackToWorkdirAndJobName(t *testing.T) {
+	requests := 0
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			return response(http.StatusOK, `{"status":"OK","output":[{"state":"COMPLETED","workdir":"/global/u2/a/asnaylor","jobname":"demo"}]}`), nil
+		case 2:
+			if r.URL.EscapedPath() != "/api/v1.2/utilities/download/perlmutter//global/u2/a/asnaylor/demo.out" {
+				t.Fatalf("escaped download path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"status":"OK","file":"demo logs\n","is_binary":false}`), nil
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, r.URL.String())
+		}
+		return nil, nil
+	})
+
+	logs, err := client.FetchJobLogs(context.Background(), "98765")
+	if err != nil {
+		t.Fatalf("FetchJobLogs returned error: %v", err)
+	}
+	if logs != "demo logs\n" {
+		t.Fatalf("logs = %q", logs)
+	}
+}
+
+func TestUploadFileUsesUtilitiesEndpoint(t *testing.T) {
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("method = %s, want PUT", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/v1.2/utilities/upload/perlmutter//pscratch/sd/a/alice/input.txt" {
+			t.Fatalf("escaped upload path = %s", r.URL.EscapedPath())
+		}
+		if err := r.ParseMultipartForm(1024); err != nil {
+			t.Fatalf("parse multipart form: %v", err)
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			t.Fatalf("form file: %v", err)
+		}
+		defer file.Close()
+		if header.Filename != "input.txt" {
+			t.Fatalf("filename = %q, want input.txt", header.Filename)
+		}
+		data, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatalf("read upload file: %v", err)
+		}
+		if string(data) != "payload" {
+			t.Fatalf("upload contents = %q", data)
+		}
+		return response(http.StatusOK, `{"status":"OK","file":"/pscratch/sd/a/alice/input.txt"}`), nil
+	})
+
+	err := client.UploadFile(context.Background(), "perlmutter", "/pscratch/sd/a/alice/input.txt", "input.txt", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatalf("UploadFile returned error: %v", err)
+	}
+}
+
+func TestRunCommandSubmitsCommandAndWaitsForTask(t *testing.T) {
+	requests := 0
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", r.Method)
+			}
+			if r.URL.EscapedPath() != "/api/v1.2/utilities/command/perlmutter" {
+				t.Fatalf("escaped command path = %s", r.URL.EscapedPath())
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("parse command form: %v", err)
+			}
+			if got := r.PostForm.Get("executable"); got != "mkdir -p -- '/pscratch/demo'" {
+				t.Fatalf("executable = %q", got)
+			}
+			return response(http.StatusOK, `{"status":"OK","task_id":"task-123"}`), nil
+		case 2:
+			if r.Method != http.MethodGet {
+				t.Fatalf("method = %s, want GET", r.Method)
+			}
+			if r.URL.EscapedPath() != "/api/v1.2/tasks/task-123" {
+				t.Fatalf("escaped task path = %s", r.URL.EscapedPath())
+			}
+			return response(http.StatusOK, `{"id":"task-123","status":"completed","result":"ok"}`), nil
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, r.URL.String())
+		}
+		return nil, nil
+	})
+
+	result, err := client.RunCommand(context.Background(), "perlmutter", "mkdir -p -- '/pscratch/demo'")
+	if err != nil {
+		t.Fatalf("RunCommand returned error: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("result = %q, want ok", result)
+	}
+}
+
+func TestDownloadFileRequestsBinaryData(t *testing.T) {
+	payload := []byte{0, 1, 2, 3}
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/v1.2/utilities/download/perlmutter//pscratch/sd/a/alice/output.bin" {
+			t.Fatalf("escaped download path = %s", r.URL.EscapedPath())
+		}
+		if r.URL.Query().Get("binary") != "true" {
+			t.Fatalf("binary query = %q, want true", r.URL.Query().Get("binary"))
+		}
+		body := fmt.Sprintf(`{"status":"OK","file":%q,"is_binary":true}`, base64.StdEncoding.EncodeToString(payload))
+		return response(http.StatusOK, body), nil
+	})
+
+	data, err := client.DownloadFile(context.Background(), "perlmutter", "/pscratch/sd/a/alice/output.bin")
+	if err != nil {
+		t.Fatalf("DownloadFile returned error: %v", err)
+	}
+	if string(data) != string(payload) {
+		t.Fatalf("download data = %v, want %v", data, payload)
 	}
 }
 
@@ -83,8 +268,8 @@ func TestSubmitJobRequiresJobID(t *testing.T) {
 	})
 
 	_, err := client.SubmitJob(context.Background(), JobSubmissionRequest{Script: "script", System: "perlmutter"})
-	if err == nil || !strings.Contains(err.Error(), "missing jobid") {
-		t.Fatalf("error = %v, want missing jobid", err)
+	if err == nil || !strings.Contains(err.Error(), "missing task_id") {
+		t.Fatalf("error = %v, want missing task_id", err)
 	}
 }
 

@@ -6,7 +6,7 @@ import (
 	"io"
 	"log"
 	"net/url"
-	"os"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +25,8 @@ type NerscProvider struct {
 	sfClientFactory      jobClientFactory
 	tokenResolver        TokenResolver
 	nodeName             string
+	nodeAddress          string
+	localTransferRoot    string
 	transferPollInterval time.Duration
 	transferTimeout      time.Duration
 	mu                   sync.RWMutex
@@ -39,6 +41,9 @@ type jobClient interface {
 	GetJobStatus(context.Context, string) (string, error)
 	CancelJob(context.Context, string) error
 	FetchJobLogs(context.Context, string) (string, error)
+	UploadFile(context.Context, string, string, string, io.Reader) error
+	RunCommand(context.Context, string, string) (string, error)
+	DownloadFile(context.Context, string, string) ([]byte, error)
 	StartGlobusTransfer(context.Context, superfacility.GlobusTransferRequest) (superfacility.GlobusTransfer, error)
 	CheckGlobusTransfer(context.Context, string) (superfacility.GlobusTransferResult, error)
 }
@@ -57,6 +62,8 @@ const (
 	annotationInputSource     = "nersc.sf/inputSource"
 	annotationOutputDest      = "nersc.sf/outputDest"
 	annotationStageOut        = "nersc.sf/stageOut"
+	annotationTransferMode    = "nersc.sf/transferMode"
+	annotationScratchBase     = "nersc.sf/scratchBase"
 	annotationStageVolume     = "nersc.sf/stageVolume"
 	annotationInputVolume     = "nersc.sf/inputVolume"
 	annotationOutputVolume    = "nersc.sf/outputVolume"
@@ -65,20 +72,32 @@ const (
 
 type podJobState struct {
 	jobID string
-	token string
+	pod   *corev1.Pod
 }
 
 type podStagingState struct {
+	transferMode     stagingTransferMode
 	inputTransferID  string
 	inputSource      *globusLocation
+	inputLocalPath   string
 	inputTargetDir   string
+	inputTargetPath  string
 	outputTransferID string
 	outputStatus     transferStatus
 	outputError      string
 	outputRequest    *superfacility.GlobusTransferRequest
 	outputDest       *globusLocation
+	outputLocalPath  string
 	outputSourceDir  string
+	outputSourcePath string
 }
+
+type stagingTransferMode string
+
+const (
+	stagingTransferModeGlobus stagingTransferMode = "globus"
+	stagingTransferModeSFAPI  stagingTransferMode = "sfapi"
+)
 
 type transferStatus string
 
@@ -119,11 +138,36 @@ func NewNerscProvider(endpoint, nodeName string, tokenResolver TokenResolver) (*
 		sfClientFactory:      func(token string) jobClient { return superfacility.New(endpoint, token) },
 		tokenResolver:        tokenResolver,
 		nodeName:             nodeName,
+		nodeAddress:          "127.0.0.1",
 		transferPollInterval: defaultTransferPollInterval,
 		transferTimeout:      defaultTransferTimeout,
 		podMap:               make(map[string]podJobState),
 		stagingMap:           make(map[string]*podStagingState),
 	}, nil
+}
+
+func (p *NerscProvider) SetNodeAddress(address string) {
+	address = strings.TrimSpace(address)
+	if address != "" {
+		p.nodeAddress = address
+	}
+}
+
+func (p *NerscProvider) SetLocalTransferRoot(root string) {
+	root = strings.TrimSpace(root)
+	if root != "" {
+		p.localTransferRoot = root
+	}
+}
+
+func VirtualNodeLabels(nodeName string) map[string]string {
+	return map[string]string{
+		"type":                   "virtual-kubelet",
+		"kubernetes.io/role":     "agent",
+		"kubernetes.io/hostname": nodeName,
+		"kubernetes.io/os":       "linux",
+		"kubernetes.io/arch":     "amd64",
+	}
 }
 
 func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
@@ -149,23 +193,23 @@ func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return fmt.Errorf("create Superfacility client for pod %s: %w", key, err)
 	}
 
-	user := os.Getenv("USER")
-	if user == "" {
-		user = "default"
-	}
-
 	ssName, ordinal := detectStatefulSet(pod)
+
+	scratchRoot := getAnnotation(pod, annotationScratchBase)
+	if scratchRoot == "" {
+		scratchRoot = "$SCRATCH/vk-provider-nersc"
+	}
 
 	var jobScratchBase string
 	if ssName != "" {
-		jobScratchBase = fmt.Sprintf("/global/cscratch1/sd/%s/%s/%d", user, ssName, ordinal)
+		jobScratchBase = path.Join(scratchRoot, ssName, strconv.Itoa(ordinal))
 	} else {
-		jobScratchBase = fmt.Sprintf("/global/cscratch1/sd/%s/%s", user, pod.Name)
+		jobScratchBase = path.Join(scratchRoot, pod.Name)
 	}
 
 	volumeScratchPaths := make(map[string]string)
 	for _, vol := range pod.Spec.Volumes {
-		scratchPath := fmt.Sprintf("%s/%s", jobScratchBase, vol.Name)
+		scratchPath := path.Join(jobScratchBase, vol.Name)
 		volumeScratchPaths[vol.Name] = scratchPath
 	}
 
@@ -173,19 +217,10 @@ func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if err != nil {
 		return err
 	}
-	if staging != nil && staging.inputSource != nil {
-		transferID, err := p.startAndWaitForTransfer(ctx, client, superfacility.GlobusTransferRequest{
-			SourceUUID: staging.inputSource.Endpoint,
-			TargetUUID: "perlmutter",
-			SourceDir:  staging.inputSource.Path,
-			TargetDir:  staging.inputTargetDir,
-			Username:   getAnnotation(pod, annotationGlobusUsername),
-		})
-		if err != nil {
-			return fmt.Errorf("stage input for pod %s: %w", key, err)
+	if staging != nil {
+		if err := p.stageInput(ctx, client, key, staging, pod); err != nil {
+			return err
 		}
-		staging.inputTransferID = transferID
-		log.Printf("Pod %s input staged with Globus transfer %s", key, transferID)
 	}
 
 	var script string
@@ -217,7 +252,7 @@ func (p *NerscProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		log.Printf("Pod %s was concurrently submitted as job %s; cancelled duplicate job %s", key, existing.jobID, jobID)
 		return nil
 	}
-	p.podMap[key] = podJobState{jobID: jobID, token: token}
+	p.podMap[key] = podJobState{jobID: jobID, pod: pod.DeepCopy()}
 	if p.stagingMap == nil {
 		p.stagingMap = make(map[string]*podStagingState)
 	}
@@ -242,7 +277,7 @@ func (p *NerscProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 
 	key := podKey(pod)
 	if state, exists := p.jobStateForPodKey(key); exists {
-		client, err := p.clientForToken(state.token)
+		client, _, err := p.clientForPodState(ctx, key, state)
 		if err != nil {
 			return fmt.Errorf("create Superfacility client for pod %s: %w", key, err)
 		}
@@ -294,6 +329,21 @@ func (p *NerscProvider) clientForToken(token string) (jobClient, error) {
 	return p.sfClientFactory(token), nil
 }
 
+func (p *NerscProvider) clientForPodState(ctx context.Context, key string, state podJobState) (jobClient, string, error) {
+	if state.pod == nil {
+		return nil, "", fmt.Errorf("pod %s missing stored credential reference", key)
+	}
+	token, err := p.tokenForPod(ctx, state.pod)
+	if err != nil {
+		return nil, "", err
+	}
+	client, err := p.clientForToken(token)
+	if err != nil {
+		return nil, "", err
+	}
+	return client, token, nil
+}
+
 func (p *NerscProvider) jobIDForPodKey(key string) (string, bool) {
 	state, exists := p.jobStateForPodKey(key)
 	return state.jobID, exists
@@ -329,25 +379,22 @@ func (p *NerscProvider) GetPod(ctx context.Context, namespace, name string) (*co
 	if !exists {
 		return nil, fmt.Errorf("pod %s not found", key)
 	}
-	client, err := p.clientForToken(state.token)
+	client, token, err := p.clientForPodState(ctx, key, state)
 	if err != nil {
 		return nil, fmt.Errorf("create Superfacility client for pod %s: %w", key, err)
 	}
 
 	status, err := client.GetJobStatus(ctx, state.jobID)
 	if err != nil {
+		log.Printf("Failed to get status for pod %s job %s: %v", key, state.jobID, err)
 		return nil, err
 	}
+	log.Printf("Pod %s job %s status %q", key, state.jobID, status)
 
-	podStatus := p.podStatusForJob(ctx, key, state.token, mapJobStatusToPodPhase(status))
-
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Status: podStatus,
-	}
+	pod := state.pod.DeepCopy()
+	pod.Name = name
+	pod.Namespace = namespace
+	pod.Status = p.podStatusForJob(ctx, key, token, mapJobStatusToPodPhase(status), pod)
 
 	return pod, nil
 }
@@ -377,7 +424,7 @@ func (p *NerscProvider) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 		}
 		namespace, name := parts[0], parts[1]
 
-		client, err := p.clientForToken(state.token)
+		client, token, err := p.clientForPodState(ctx, key, state)
 		if err != nil {
 			log.Printf("Failed to create Superfacility client for pod %s: %v", key, err)
 			continue
@@ -388,30 +435,82 @@ func (p *NerscProvider) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 			continue
 		}
 
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: namespace,
-			},
-			Status: p.podStatusForJob(ctx, key, state.token, mapJobStatusToPodPhase(status)),
-		}
+		pod := state.pod.DeepCopy()
+		pod.Name = name
+		pod.Namespace = namespace
+		pod.Status = p.podStatusForJob(ctx, key, token, mapJobStatusToPodPhase(status), pod)
 		pods = append(pods, pod)
 	}
 	return pods, nil
 }
 
-func (p *NerscProvider) podStatusForJob(ctx context.Context, key, token string, jobPhase corev1.PodPhase) corev1.PodStatus {
+func (p *NerscProvider) podStatusForJob(ctx context.Context, key, token string, jobPhase corev1.PodPhase, pod *corev1.Pod) corev1.PodStatus {
 	status := corev1.PodStatus{Phase: jobPhase}
-	if jobPhase != corev1.PodSucceeded {
+	if jobPhase == corev1.PodSucceeded {
+		staging := p.stagingForPodKey(key)
+		if staging != nil && staging.hasStageOut() {
+			status = p.reconcileStageOut(ctx, key, token)
+		}
+	}
+
+	return statusWithContainerStates(status, pod)
+}
+
+func statusWithContainerStates(status corev1.PodStatus, pod *corev1.Pod) corev1.PodStatus {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
 		return status
 	}
 
-	staging := p.stagingForPodKey(key)
-	if staging == nil || staging.outputRequest == nil {
-		return status
-	}
+	now := metav1.Now()
+	containerStatuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
+	for _, container := range pod.Spec.Containers {
+		containerStatus := corev1.ContainerStatus{
+			Name:         container.Name,
+			Image:        container.Image,
+			RestartCount: 0,
+		}
 
-	return p.reconcileStageOut(ctx, key, token)
+		switch status.Phase {
+		case corev1.PodPending:
+			containerStatus.State.Waiting = &corev1.ContainerStateWaiting{
+				Reason:  firstNonEmptyStatus(status.Reason, "Pending"),
+				Message: status.Message,
+			}
+		case corev1.PodRunning:
+			containerStatus.Ready = true
+			containerStatus.State.Running = &corev1.ContainerStateRunning{
+				StartedAt: now,
+			}
+		case corev1.PodSucceeded:
+			containerStatus.State.Terminated = &corev1.ContainerStateTerminated{
+				ExitCode:   0,
+				Reason:     firstNonEmptyStatus(status.Reason, "Completed"),
+				Message:    status.Message,
+				StartedAt:  now,
+				FinishedAt: now,
+			}
+		case corev1.PodFailed:
+			containerStatus.State.Terminated = &corev1.ContainerStateTerminated{
+				ExitCode:   1,
+				Reason:     firstNonEmptyStatus(status.Reason, "Error"),
+				Message:    status.Message,
+				StartedAt:  now,
+				FinishedAt: now,
+			}
+		}
+		containerStatuses = append(containerStatuses, containerStatus)
+	}
+	status.ContainerStatuses = containerStatuses
+	return status
+}
+
+func firstNonEmptyStatus(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (p *NerscProvider) GetPodLogs(ctx context.Context, namespace, name, container string, opts *corev1.PodLogOptions) (io.ReadCloser, error) {
@@ -420,9 +519,12 @@ func (p *NerscProvider) GetPodLogs(ctx context.Context, namespace, name, contain
 	if !exists {
 		return nil, fmt.Errorf("pod %s not found", key)
 	}
-	client, err := p.clientForToken(state.token)
+	client, _, err := p.clientForPodState(ctx, key, state)
 	if err != nil {
 		return nil, fmt.Errorf("create Superfacility client for pod %s: %w", key, err)
+	}
+	if opts != nil && opts.Follow {
+		return p.followPodLogs(ctx, client, state.jobID), nil
 	}
 
 	logs, err := client.FetchJobLogs(ctx, state.jobID)
@@ -431,6 +533,43 @@ func (p *NerscProvider) GetPodLogs(ctx context.Context, namespace, name, contain
 	}
 
 	return io.NopCloser(strings.NewReader(logs)), nil
+}
+
+func (p *NerscProvider) followPodLogs(ctx context.Context, client jobClient, jobID string) io.ReadCloser {
+	reader, writer := io.Pipe()
+	go func() {
+		defer writer.Close()
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			status, err := client.GetJobStatus(ctx, jobID)
+			if err != nil {
+				_ = writer.CloseWithError(err)
+				return
+			}
+			if isTerminalJobStatus(status) {
+				logs, err := client.FetchJobLogs(ctx, jobID)
+				if err != nil {
+					_ = writer.CloseWithError(err)
+					return
+				}
+				if logs != "" {
+					_, _ = io.WriteString(writer, logs)
+				}
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				_ = writer.CloseWithError(ctx.Err())
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return reader
 }
 
 func (p *NerscProvider) RunInContainer(ctx context.Context, namespace, name, container string, cmd []string, attach interface{}) error {
@@ -455,10 +594,14 @@ func (p *NerscProvider) NodeConditions(ctx context.Context) []corev1.NodeConditi
 }
 
 func (p *NerscProvider) NodeAddresses(ctx context.Context) []corev1.NodeAddress {
+	address := strings.TrimSpace(p.nodeAddress)
+	if address == "" {
+		address = "127.0.0.1"
+	}
 	return []corev1.NodeAddress{
 		{
 			Type:    corev1.NodeInternalIP,
-			Address: "127.0.0.1",
+			Address: address,
 		},
 		{
 			Type:    corev1.NodeHostName,
@@ -508,7 +651,8 @@ func (p *NerscProvider) NotifyNodeStatus(ctx context.Context, cb func(*corev1.No
 func (p *NerscProvider) nodeStatus(ctx context.Context) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: p.nodeName,
+			Name:   p.nodeName,
+			Labels: VirtualNodeLabels(p.nodeName),
 		},
 		Status: corev1.NodeStatus{
 			Conditions:      p.NodeConditions(ctx),
@@ -568,5 +712,14 @@ func mapJobStatusToPodPhase(status string) corev1.PodPhase {
 		return corev1.PodFailed
 	default:
 		return corev1.PodPending
+	}
+}
+
+func isTerminalJobStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed", "success", "failed", "error", "cancelled", "canceled":
+		return true
+	default:
+		return false
 	}
 }
