@@ -14,7 +14,9 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -211,7 +213,13 @@ func handleContainerLogs(prov *provider.NerscProvider) http.HandlerFunc {
 			return
 		}
 
-		logs, err := prov.GetPodLogs(r.Context(), parts[0], parts[1], parts[2], nil)
+		opts, err := parsePodLogOptions(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		logs, err := prov.GetPodLogs(r.Context(), parts[0], parts[1], parts[2], opts)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -223,6 +231,79 @@ func handleContainerLogs(prov *provider.NerscProvider) http.HandlerFunc {
 			log.Printf("Failed to write container logs for %s/%s/%s: %v", parts[0], parts[1], parts[2], err)
 		}
 	}
+}
+
+func parsePodLogOptions(values url.Values) (*corev1.PodLogOptions, error) {
+	opts := &corev1.PodLogOptions{
+		Container: firstQueryValue(values, "container"),
+	}
+
+	var err error
+	if opts.Follow, err = parseBoolQuery(values, "follow"); err != nil {
+		return nil, err
+	}
+	if opts.Previous, err = parseBoolQuery(values, "previous"); err != nil {
+		return nil, err
+	}
+	if opts.Timestamps, err = parseBoolQuery(values, "timestamps"); err != nil {
+		return nil, err
+	}
+	if opts.InsecureSkipTLSVerifyBackend, err = parseBoolQuery(values, "insecureSkipTLSVerifyBackend", "insecure_skip_tls_verify_backend"); err != nil {
+		return nil, err
+	}
+	if opts.SinceSeconds, err = parseInt64Query(values, "sinceSeconds", "since_seconds"); err != nil {
+		return nil, err
+	}
+	if opts.TailLines, err = parseInt64Query(values, "tailLines", "tail_lines"); err != nil {
+		return nil, err
+	}
+	if opts.LimitBytes, err = parseInt64Query(values, "limitBytes", "limit_bytes"); err != nil {
+		return nil, err
+	}
+
+	if raw := firstQueryValue(values, "sinceTime", "since_time"); raw != "" {
+		sinceTime, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sinceTime %q: %w", raw, err)
+		}
+		metav1SinceTime := metav1.NewTime(sinceTime)
+		opts.SinceTime = &metav1SinceTime
+	}
+
+	return opts, nil
+}
+
+func firstQueryValue(values url.Values, names ...string) string {
+	for _, name := range names {
+		if value := values.Get(name); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func parseBoolQuery(values url.Values, names ...string) (bool, error) {
+	raw := firstQueryValue(values, names...)
+	if raw == "" {
+		return false, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s %q: %w", names[0], raw, err)
+	}
+	return value, nil
+}
+
+func parseInt64Query(values url.Values, names ...string) (*int64, error) {
+	raw := firstQueryValue(values, names...)
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s %q: %w", names[0], raw, err)
+	}
+	return &value, nil
 }
 
 func selfSignedServingCert(nodeName, nodeAddress string) (tls.Certificate, error) {

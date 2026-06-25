@@ -223,6 +223,15 @@ func TestCreateGetLogsAndDeletePod(t *testing.T) {
 	if status.Phase != corev1.PodRunning {
 		t.Fatalf("phase = %s, want Running", status.Phase)
 	}
+	if len(status.ContainerStatuses) != 1 {
+		t.Fatalf("container statuses = %d, want 1", len(status.ContainerStatuses))
+	}
+	if status.ContainerStatuses[0].Name != "main" {
+		t.Fatalf("container status name = %q, want main", status.ContainerStatuses[0].Name)
+	}
+	if status.ContainerStatuses[0].State.Running == nil {
+		t.Fatalf("container state = %+v, want running", status.ContainerStatuses[0].State)
+	}
 
 	logs, err := provider.GetPodLogs(context.Background(), pod.Namespace, pod.Name, "main", nil)
 	if err != nil {
@@ -253,6 +262,56 @@ func TestCreateGetLogsAndDeletePod(t *testing.T) {
 		if token != "job-token" {
 			t.Fatalf("client tokens = %+v, want all job-token", client.clientTokens)
 		}
+	}
+}
+
+func TestGetPodStatusSynthesizesSucceededContainerStatus(t *testing.T) {
+	client := &fakeJobClient{
+		statusByJob: map[string]string{"job-1": "completed"},
+	}
+	provider := newTestProvider(client)
+	pod := testPod()
+	provider.podMap[podKey(pod)] = podJobState{jobID: "job-1", pod: pod.DeepCopy()}
+
+	status, err := provider.GetPodStatus(context.Background(), pod.Namespace, pod.Name)
+	if err != nil {
+		t.Fatalf("GetPodStatus returned error: %v", err)
+	}
+	if status.Phase != corev1.PodSucceeded {
+		t.Fatalf("phase = %s, want Succeeded", status.Phase)
+	}
+	if len(status.ContainerStatuses) != 1 {
+		t.Fatalf("container statuses = %d, want 1", len(status.ContainerStatuses))
+	}
+	terminated := status.ContainerStatuses[0].State.Terminated
+	if terminated == nil {
+		t.Fatalf("container state = %+v, want terminated", status.ContainerStatuses[0].State)
+	}
+	if terminated.ExitCode != 0 {
+		t.Fatalf("terminated exit code = %d, want 0", terminated.ExitCode)
+	}
+}
+
+func TestGetPodLogsFollowWaitsForTerminalJobLogs(t *testing.T) {
+	client := &fakeJobClient{
+		statusByJob: map[string]string{"job-1": "completed"},
+		logsByJob:   map[string]string{"job-1": "followed logs\n"},
+	}
+	provider := newTestProvider(client)
+	pod := testPod()
+	provider.podMap[podKey(pod)] = podJobState{jobID: "job-1", pod: pod.DeepCopy()}
+
+	logs, err := provider.GetPodLogs(context.Background(), pod.Namespace, pod.Name, "main", &corev1.PodLogOptions{Follow: true})
+	if err != nil {
+		t.Fatalf("GetPodLogs returned error: %v", err)
+	}
+	defer logs.Close()
+	data, err := io.ReadAll(logs)
+	if err != nil {
+		t.Fatalf("read logs: %v", err)
+	}
+	if string(data) != "followed logs\n" {
+		t.Fatalf("logs = %q, want followed logs newline", data)
 	}
 }
 
